@@ -26,6 +26,18 @@ npm start
 npm run dist:win
 ```
 
+打包后的安装程序默认位于：
+
+```bash
+dist/清结算网银账单Excel生成小工具-1.0.0-setup.exe
+```
+
+## GitHub 下载说明
+
+- GitHub 网页上的 `Download ZIP` 下载的是源码，不包含已构建的 `exe`。
+- 如果需要现成安装程序，请到仓库的 `Actions` 页面下载 `windows-installer` 构建产物。
+- 如果是在本地 Windows 机器上自行生成 `exe`，执行 `npm install` 后运行 `npm run dist:win`。
+
 ## 数据和日志目录
 
 - 生成文件目录：`文档/清结算网银账单Excel生成小工具/exports/执行日期`
