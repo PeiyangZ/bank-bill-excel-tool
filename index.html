@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>清结算网银账单Excel生成小工具</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="window-bar">
+        <div class="drag-region"></div>
+        <div class="window-actions no-drag">
+          <button id="minimizeBtn" class="window-btn" type="button" aria-label="最小化">-</button>
+          <button id="maximizeBtn" class="window-btn" type="button" aria-label="最大化">□</button>
+          <button id="closeBtn" class="window-btn close-btn" type="button" aria-label="关闭">×</button>
+        </div>
+      </header>
+
+      <main class="page-body">
+        <h1 class="page-title">清结算网银账单Excel生成小工具</h1>
+
+        <section class="control-board">
+          <div class="control-row">
+            <div class="cell left">
+              <button id="importFileBtn" class="primary-btn" type="button">导入文件</button>
+            </div>
+            <div class="cell center">
+              <label class="select-label" for="templateSelect">模版</label>
+              <select id="templateSelect" class="template-select"></select>
+            </div>
+            <div class="cell right">
+              <button id="exportFileBtn" class="primary-btn" type="button" disabled>导出文件</button>
+            </div>
+          </div>
+
+          <div class="control-row">
+            <div class="cell left">
+              <button id="importTemplateBtn" class="secondary-btn" type="button">导入模版</button>
+            </div>
+            <div class="cell center">
+              <button id="manageTemplateBtn" class="secondary-btn" type="button">管理模版</button>
+            </div>
+            <div class="cell right">
+              <div id="statusBox" class="status-box">等待操作</div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="page-footer">
+        <div class="version-text">版本号：<span id="appVersion">-</span></div>
+      </footer>
+    </div>
+
+    <div id="modalRoot"></div>
+    <script src="./src/renderer.js"></script>
+  </body>
+</html>
