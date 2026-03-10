@@ -84,7 +84,23 @@
               </label>
               <label class="new-account-field">
                 <span class="new-account-label">币种</span>
-                <input id="newAccountCurrencyInput" class="new-account-input" type="text" spellcheck="false" />
+                <div class="new-account-currency-row">
+                  <input id="newAccountCurrencyInput" class="new-account-input new-account-currency-input" type="text" spellcheck="false" />
+                  <div id="newAccountCurrencyDropdownWrap" class="new-account-currency-dropdown-wrap" hidden>
+                    <button
+                      id="newAccountCurrencyDropdownBtn"
+                      class="new-account-input new-account-currency-dropdown-btn"
+                      type="button"
+                      aria-haspopup="true"
+                      aria-expanded="false"
+                    ></button>
+                    <div id="newAccountCurrencyDropdownPanel" class="new-account-currency-dropdown-panel" hidden></div>
+                  </div>
+                  <label class="new-account-checkbox-label">
+                    <input id="newAccountMultiCurrencyCheckbox" class="new-account-checkbox" type="checkbox" />
+                    <span>多币种账户</span>
+                  </label>
+                </div>
               </label>
               <label class="new-account-field">
                 <span class="new-account-label">银行账号</span>
@@ -92,7 +108,7 @@
               </label>
               <label class="new-account-field">
                 <span class="new-account-label">开户日期</span>
-                <input id="newAccountOpenDateInput" class="new-account-input" type="date" />
+                <input id="newAccountOpenDateInput" class="new-account-input" type="date" value="" />
               </label>
             </div>
             <div class="new-account-actions-row">
@@ -127,8 +143,8 @@
               <canvas
                 id="backgroundSpectrumCanvas"
                 class="palette-spectrum-canvas"
-                width="320"
-                height="320"
+                width="560"
+                height="560"
                 aria-hidden="true"
               ></canvas>
               <div id="backgroundSpectrumCrosshair" class="palette-spectrum-crosshair" hidden></div>

@@ -5,9 +5,11 @@ const path = require('node:path');
 const XLSX = require('xlsx');
 const { AppDatabase } = require('../src/backend/database');
 const {
+  buildDetailExportRows,
   buildMappedRows,
   extractHeaders,
   FIXED_FIELD_VALUE_PREFIX,
+  inferEndingBalance,
   loadCurrencyMappings,
   loadEnumValues,
   writeBalanceWorkbook,
@@ -26,6 +28,9 @@ function run() {
   const projectRoot = path.resolve(__dirname, '..');
   const bundledEnumPath = path.join(projectRoot, 'COMMON枚举.xlsx');
   const currencyMappingPath = path.join(projectRoot, 'assets', '币种映射表.xlsx');
+  const iconSourcePath = path.join(projectRoot, 'assets', 'app-icon-source.png');
+  const runtimeIconPath = path.join(projectRoot, 'assets', 'app-icon.ico');
+  const buildIconPath = path.join(projectRoot, 'build', 'icon.ico');
   const dbPath = path.join(root, 'app.sqlite');
   const templatePath = path.join(root, 'template.xlsx');
   const dataPath = path.join(root, 'input.xlsx');
@@ -35,7 +40,11 @@ function run() {
   const balanceOutputPath = path.join(root, '2026-03-09', 'balance', 'template-Balance-2026-03-09.xlsx');
 
   makeWorkbook(templatePath, [['原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H'], ['值1', '值2', '值3', '值4', '值5', '值6', '值7', '值8']]);
-  makeWorkbook(dataPath, [['原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H'], ['$1,234.56CR', 'DB789.01元', '2026-03-09', '20260310', 'NET_001', 88, '美元', '456.78']]);
+  makeWorkbook(dataPath, [
+    ['原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H'],
+    ['$1,234.56CR', 'DB789.01元', '2026-03-09', '20260310', 'NET_001', 88, '美元', 'BAL 456.78元'],
+    ['', '0', '2026-03-10', '20260310', 'NET_002', 99, '港元', '99.99']
+  ]);
   makeWorkbook(unmappedDataPath, [['原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H'], ['100', '200', '2026-03-09', '20260310', 'NET_001', 88, '测试币', '456.78']]);
   makeWorkbook(balanceTemplatePath, [
     ['银行名称', '所在地', '币种', '银行账号', '账单日期', '期初余额', '期初可用余额', '期末余额', '期末可用余额', '扩展字段'],
@@ -78,6 +87,9 @@ function run() {
 
   assert(fs.existsSync(bundledEnumPath));
   assert(fs.existsSync(currencyMappingPath));
+  assert(fs.existsSync(iconSourcePath));
+  assert(fs.existsSync(runtimeIconPath));
+  assert(fs.existsSync(buildIconPath));
   const enumValues = loadEnumValues(bundledEnumPath);
   const currencyMappings = loadCurrencyMappings(currencyMappingPath);
   assert.strictEqual(enumValues[0], 'BillDate');
@@ -105,8 +117,16 @@ function run() {
     }
   });
   assert.deepStrictEqual(detailRows.issues, []);
+  assert.strictEqual(detailRows[1][0], '456.78');
+  assert.strictEqual(detailRows[2][0], '99.99');
+  const detailExportRows = buildDetailExportRows(detailRows);
+  assert.strictEqual(detailExportRows.length, 2);
+  assert.strictEqual(detailExportRows.skippedRows.length, 1);
+  assert.strictEqual(detailExportRows.skippedRows[0].sourceRowNumber, 3);
+  assert.deepStrictEqual(detailExportRows[0], ['BillDate', 'ValueDate', 'Channel', 'MerchantId', 'Currency', 'Credit Amount', 'Debit Amount', 'Extra Information']);
+  assert.strictEqual(detailExportRows[1][0], '2026-03-09');
   writeWorkbookRows({
-    rows: detailRows,
+    rows: detailExportRows,
     outputFilePath: detailOutputPath
   });
 
@@ -131,6 +151,43 @@ function run() {
   assert.strictEqual(unmappedRows.issues[0].sourceField, '原字段G');
   assert.strictEqual(unmappedRows.issues[0].rawValue, '测试币');
 
+  const customCurrencyRows = buildMappedRows({
+    inputFilePath: dataPath,
+    mappingByField: {
+      Balance: '原字段H',
+      BillDate: '原字段C',
+      ValueDate: '原字段D',
+      Channel: `${FIXED_FIELD_VALUE_PREFIX}CHB`,
+      MerchantId: `${FIXED_FIELD_VALUE_PREFIX}SELF_INPUT_001`,
+      Currency: `${FIXED_FIELD_VALUE_PREFIX}USD_FIXED`,
+      'Credit Amount': '原字段A',
+      'Debit Amount': '原字段B'
+    },
+    orderedTargetFields: ['Balance', 'BillDate', 'ValueDate', 'Channel', 'MerchantId', 'Currency', 'Credit Amount', 'Debit Amount']
+  });
+  assert.strictEqual(customCurrencyRows[1][5], 'USD_FIXED');
+  assert.deepStrictEqual(customCurrencyRows.issues, []);
+
+  assert.strictEqual(
+    inferEndingBalance({
+      previousEndBalance: 606784530.83,
+      dateLabel: '2026-02-12',
+      entries: [
+        {
+          balanceValue: 466784381.89,
+          creditAmount: 0,
+          debitAmount: 40000074.47
+        },
+        {
+          balanceValue: 506784456.36,
+          creditAmount: 0,
+          debitAmount: 100000074.47
+        }
+      ]
+    }),
+    466784381.89
+  );
+
   writeBalanceWorkbook({
     templateFilePath: balanceTemplatePath,
     records: [['CHB', 'HK', 'USD', 'SELF_INPUT_001', '2026-03-09', '', '', 456.78, '']],
@@ -148,28 +205,27 @@ function run() {
     worksheet,
     { header: 1, defval: '' }
   );
-  assert.deepStrictEqual(rows[0], ['Balance', 'BillDate', 'ValueDate', 'Channel', 'MerchantId', 'Currency', 'Credit Amount', 'Debit Amount', 'Extra Information']);
-  assert.strictEqual(rows[1][0], 456.78);
-  assert.strictEqual(rows[1][3], 'CHB');
-  assert.strictEqual(rows[1][4], 'SELF_INPUT_001');
-  assert.strictEqual(rows[1][5], 'USD');
-  assert.strictEqual(rows[1][8], '');
+  assert.deepStrictEqual(rows[0], ['BillDate', 'ValueDate', 'Channel', 'MerchantId', 'Currency', 'Credit Amount', 'Debit Amount', 'Extra Information']);
+  assert.strictEqual(rows.length, 2);
+  assert.strictEqual(rows[1][2], 'CHB');
+  assert.strictEqual(rows[1][3], 'SELF_INPUT_001');
+  assert.strictEqual(rows[1][4], 'USD');
+  assert.strictEqual(rows[1][7], '');
+  assert.strictEqual(worksheet.A2.v, 46090);
   assert.strictEqual(worksheet.A2.t, 'n');
-  assert.strictEqual(worksheet.A2.z, '0.00');
+  assert.strictEqual(worksheet.A2.z, 'yyyy-mm-dd');
   assert.strictEqual(worksheet.B2.t, 'n');
   assert.strictEqual(worksheet.B2.z, 'yyyy-mm-dd');
-  assert.strictEqual(worksheet.C2.t, 'n');
-  assert.strictEqual(worksheet.C2.z, 'yyyy-mm-dd');
+  assert.strictEqual(worksheet.C2.t, 's');
+  assert.strictEqual(worksheet.C2.z, '@');
   assert.strictEqual(worksheet.D2.t, 's');
   assert.strictEqual(worksheet.D2.z, '@');
-  assert.strictEqual(worksheet.E2.t, 's');
-  assert.strictEqual(worksheet.E2.z, '@');
-  assert.strictEqual(worksheet.G2.v, 1234.56);
+  assert.strictEqual(worksheet.F2.v, 1234.56);
+  assert.strictEqual(worksheet.F2.t, 'n');
+  assert.strictEqual(worksheet.F2.z, '0.00');
+  assert.strictEqual(worksheet.G2.v, 789.01);
   assert.strictEqual(worksheet.G2.t, 'n');
   assert.strictEqual(worksheet.G2.z, '0.00');
-  assert.strictEqual(worksheet.H2.v, 789.01);
-  assert.strictEqual(worksheet.H2.t, 'n');
-  assert.strictEqual(worksheet.H2.z, '0.00');
 
   assert(fs.existsSync(balanceOutputPath));
   const balanceWorkbook = XLSX.readFile(balanceOutputPath, {

@@ -3,10 +3,12 @@ const path = require('node:path');
 const { app, BrowserWindow, dialog, ipcMain, nativeImage } = require('electron');
 const { AppDatabase } = require('./backend/database');
 const {
+  buildDetailExportRows,
   buildMappedRows,
   FileValidationError,
   FIXED_FIELD_VALUE_PREFIX,
   extractHeaders,
+  inferEndingBalance,
   loadCurrencyMappings,
   loadEnumValues,
   normalizeCell,
@@ -43,6 +45,7 @@ const BUNDLED_ENUM_FILE_NAME = 'COMMON枚举.xlsx';
 const CURRENCY_MAPPING_FILE_NAME = '币种映射表.xlsx';
 const MISSING_ENUM_MESSAGE = '内置网银账单枚举表缺失，请检查安装包';
 const MERCHANT_ID_SELF_INPUT_OPTION = '自己输入';
+const CUSTOM_INPUT_TARGET_FIELDS = new Set(['MerchantId', 'Currency']);
 const BACKGROUND_IMAGE_LIMITS = Object.freeze({
   maxSizeBytes: 5 * 1024 * 1024,
   minWidth: 1200,
@@ -51,6 +54,7 @@ const BACKGROUND_IMAGE_LIMITS = Object.freeze({
   maxHeight: 4096
 });
 const SUPPORTED_BACKGROUND_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+const APP_ICON_FILE_NAMES = ['app-icon.ico', 'app-icon.png'];
 
 function pad(value) {
   return String(value).padStart(2, '0');
@@ -75,6 +79,24 @@ function ensureStorageRoot() {
 
 function getBackgroundAssetsDir() {
   return path.join(ensureStorageRoot(), 'background');
+}
+
+function getBundledIconPath() {
+  const candidates = APP_ICON_FILE_NAMES.flatMap((fileName) => [
+    path.join(app.getAppPath(), 'assets', fileName),
+    path.join(__dirname, '..', 'assets', fileName)
+  ]);
+  return candidates.find((filePath) => fs.existsSync(filePath)) || '';
+}
+
+function loadBundledIcon() {
+  const iconPath = getBundledIconPath();
+  if (!iconPath) {
+    return undefined;
+  }
+
+  const icon = nativeImage.createFromPath(iconPath);
+  return icon.isEmpty() ? undefined : icon;
 }
 
 function clearLastErrorReport() {
@@ -194,6 +216,27 @@ function getEnumConfig() {
 function getCurrencyMappingTablePath() {
   const appRoot = app.getAppPath();
   return path.join(appRoot, 'assets', CURRENCY_MAPPING_FILE_NAME);
+}
+
+function getAvailableCurrencyCodes() {
+  const currencyMappingTablePath = getCurrencyMappingTablePath();
+
+  if (!fs.existsSync(currencyMappingTablePath)) {
+    return [];
+  }
+
+  try {
+    return Array.from(
+      new Set(
+        loadCurrencyMappings(currencyMappingTablePath)
+          .map((mapping) => normalizeCell(mapping.englishCode))
+          .filter((code) => code !== '')
+      )
+    );
+  } catch (error) {
+    console.error(error);
+    return [];
+  }
 }
 
 function normalizeBackgroundColor(colorHex) {
@@ -402,7 +445,17 @@ function getBalanceTemplatePath() {
 function buildImportWarningDetailLines(warnings) {
   const detailLines = [];
   const currencyWarnings = warnings.filter((warning) => warning.type === 'currency-unmapped');
+  const skippedDetailWarnings = warnings.filter((warning) => warning.type === 'detail-row-skipped');
   const balanceWarnings = warnings.filter((warning) => warning.type === 'balance-generate-failed');
+
+  if (skippedDetailWarnings.length) {
+    detailLines.push('以下明细记录因 Credit Amount 和 Debit Amount 同时为 0 或空值，未写入导出的明细账单：');
+    skippedDetailWarnings.forEach((warning) => {
+      detailLines.push(
+        `第${warning.rowNumber}行，Credit Amount="${warning.creditAmount || '(空)'}"，Debit Amount="${warning.debitAmount || '(空)'}"`
+      );
+    });
+  }
 
   if (currencyWarnings.length) {
     detailLines.push('以下 Currency 原值未匹配到内置币种映射表，导出文件已保留原值：');
@@ -430,7 +483,37 @@ function buildImportWarningDetailLines(warnings) {
   return detailLines;
 }
 
-function decodeMerchantIdMappingValue(rawValue) {
+function buildImportWarningMessage({ warnings, balanceReady, balanceRequested }) {
+  const warningParts = [];
+  const skippedDetailCount = warnings.filter((warning) => warning.type === 'detail-row-skipped').length;
+  const hasCurrencyWarning = warnings.some((warning) => warning.type === 'currency-unmapped');
+  const hasBalanceWarning = warnings.some((warning) => warning.type === 'balance-generate-failed');
+  const exportParts = ['明细账单可导出'];
+
+  if (balanceReady) {
+    exportParts.push('余额账单可导出');
+  } else if (balanceRequested) {
+    exportParts.push('余额账单未生成');
+  }
+
+  if (skippedDetailCount > 0) {
+    warningParts.push(`已过滤${skippedDetailCount}条收支均为0或空值的明细`);
+  }
+
+  if (hasCurrencyWarning) {
+    warningParts.push('存在币种未匹配记录');
+  }
+
+  if (hasBalanceWarning) {
+    warningParts.push('存在余额账单异常');
+  }
+
+  return warningParts.length
+    ? `${exportParts.join('，')}，${warningParts.join('，')}，请点击状态框导出报错文件`
+    : exportParts.join('，');
+}
+
+function decodeCustomInputMappingValue(rawValue) {
   const normalizedValue = normalizeCell(rawValue);
 
   if (!normalizedValue.startsWith(FIXED_FIELD_VALUE_PREFIX)) {
@@ -479,20 +562,20 @@ function normalizeMappingRows({ template, mappings, enumValues }) {
 
   return targetFields.map((fieldName) => {
     const savedValue = savedMap.get(fieldName) || '';
-    const merchantIdMapping = fieldName === 'MerchantId'
-      ? decodeMerchantIdMappingValue(savedValue)
+    const customInputMapping = CUSTOM_INPUT_TARGET_FIELDS.has(fieldName)
+      ? decodeCustomInputMappingValue(savedValue)
       : null;
 
     return {
       templateField: fieldName,
       mappedField: fieldName === 'Balance'
         ? savedValue || '无'
-        : merchantIdMapping
-          ? merchantIdMapping.mappedField
+        : customInputMapping
+          ? customInputMapping.mappedField
           : savedValue === '无'
             ? ''
             : savedValue || '',
-      customValue: merchantIdMapping ? merchantIdMapping.customValue : ''
+      customValue: customInputMapping ? customInputMapping.customValue : ''
     };
   });
 }
@@ -666,10 +749,6 @@ function ensureNumericValue(rawValue, { fieldName, dateLabel, allowBlank = false
   return parsedValue;
 }
 
-function roundAmount(value) {
-  return Number(value.toFixed(2));
-}
-
 function pickSingleTextValue(values, fieldName) {
   const uniqueValues = Array.from(
     new Set(values.map((value) => normalizeCell(value)).filter((value) => value !== ''))
@@ -780,39 +859,11 @@ function deriveBalanceRecords({ detailRows, templateName, balanceTemplateFields 
 
   dateKeys.forEach((dateLabel) => {
     const entries = groupedRows.get(dateLabel);
-    const uniqueBalances = Array.from(
-      new Set(
-        entries
-          .filter((entry) => entry.balanceValue !== null)
-          .map((entry) => roundAmount(entry.balanceValue))
-      )
-    );
-    let endBalance = null;
-
-    if (uniqueBalances.length === 0) {
-      throw new FileValidationError('FILE_READ', `${dateLabel} 未找到期末余额`);
-    }
-
-    if (uniqueBalances.length === 1) {
-      [endBalance] = uniqueBalances;
-    } else {
-      if (previousEndBalance === null) {
-        throw new FileValidationError('FILE_READ', `${dateLabel} 存在多个期末余额，且无法推导首日余额`);
-      }
-
-      const amount = roundAmount(
-        previousEndBalance
-          + entries.reduce((sum, entry) => sum + entry.creditAmount, 0)
-          + entries.reduce((sum, entry) => sum + entry.debitAmount, 0)
-      );
-      const matchedBalance = uniqueBalances.find((balance) => Math.abs(balance - amount) < 0.005);
-
-      if (matchedBalance === undefined) {
-        throw new FileValidationError('FILE_READ', `${dateLabel} 的期末余额无法根据收支金额推导`);
-      }
-
-      endBalance = matchedBalance;
-    }
+    const endBalance = inferEndingBalance({
+      previousEndBalance,
+      entries,
+      dateLabel
+    });
 
     previousEndBalance = endBalance;
     records.push(buildBalanceTemplateRow(balanceTemplateFields, {
@@ -866,26 +917,48 @@ function buildNewAccountBalanceRecords({
   bankName,
   location,
   currency,
+  currencies = [],
   bankAccount,
   openingDate,
   balanceTemplateFields
 }) {
   const billDates = buildNewAccountBillDates(openingDate);
-  const records = billDates.map((billDate) => buildBalanceTemplateRow(balanceTemplateFields, {
-    银行名称: bankName,
-    所在地: location,
-    币种: currency,
-    银行账号: bankAccount,
-    账单日期: formatDateLabel(billDate),
-    期初余额: '',
-    期初可用余额: '',
-    期末余额: 0,
-    期末可用余额: ''
-  }));
+  const currencyValues = Array.from(
+    new Set(
+      (Array.isArray(currencies) && currencies.length ? currencies : [currency])
+        .map((value) => normalizeCell(value))
+        .filter((value) => value !== '')
+    )
+  );
+
+  if (!currencyValues.length) {
+    throw new FileValidationError('FILE_READ', '至少需要提供一个币种');
+  }
+
+  const records = [];
+
+  billDates.forEach((billDate) => {
+    const billDateLabel = formatDateLabel(billDate);
+
+    currencyValues.forEach((currencyValue) => {
+      records.push(buildBalanceTemplateRow(balanceTemplateFields, {
+        银行名称: bankName,
+        所在地: location,
+        币种: currencyValue,
+        银行账号: bankAccount,
+        账单日期: billDateLabel,
+        期初余额: '',
+        期初可用余额: '',
+        期末余额: 0,
+        期末可用余额: ''
+      }));
+    });
+  });
 
   return {
     records,
-    billDates: billDates.map((billDate) => formatDateLabel(billDate))
+    billDates: billDates.map((billDate) => formatDateLabel(billDate)),
+    currencies: currencyValues
   };
 }
 
@@ -905,6 +978,7 @@ function sendWindowState() {
 }
 
 function createWindow() {
+  const windowIcon = loadBundledIcon();
   mainWindow = new BrowserWindow({
     width: 1240,
     height: 860,
@@ -913,11 +987,16 @@ function createWindow() {
     frame: false,
     backgroundColor: '#f3efe6',
     show: false,
+    icon: windowIcon,
     webPreferences: {
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js')
     }
   });
+
+  if (windowIcon && process.platform !== 'darwin') {
+    mainWindow.setIcon(windowIcon);
+  }
 
   mainWindow.loadFile(path.join(app.getAppPath(), 'index.html'));
   mainWindow.once('ready-to-show', () => {
@@ -983,6 +1062,7 @@ function registerAppHandlers() {
       enumFileName: enumConfig ? enumConfig.sourceFileName : '',
       hasErrorReport: Boolean(lastErrorReport && fs.existsSync(lastErrorReport.filePath)),
       accountMappingCount: database.listAccountMappings().length,
+      currencyOptions: getAvailableCurrencyCodes(),
       backgroundConfig: buildBackgroundPayload(),
       previewModal: process.env.APP_PREVIEW_MODAL || ''
     };
@@ -1267,11 +1347,11 @@ function validateTemplateMappings({ template, mappings, enumValues }) {
       return;
     }
 
-    if (targetField === 'MerchantId' && normalizedSourceField === MERCHANT_ID_SELF_INPUT_OPTION) {
+    if (CUSTOM_INPUT_TARGET_FIELDS.has(targetField) && normalizedSourceField === MERCHANT_ID_SELF_INPUT_OPTION) {
       const customValue = selectedMapping.customValue;
 
       if (!customValue) {
-        throw new FileValidationError('FILE_READ', 'MerchantId 选择“自己输入”后必须填写内容');
+        throw new FileValidationError('FILE_READ', `${targetField} 选择“自己输入”后必须填写内容`);
       }
 
       cleanedMappings.push({
@@ -1497,7 +1577,7 @@ function prepareGeneratedFiles({
 
   let currencyMappings = [];
 
-  if (mappingByTargetField.Currency) {
+  if (mappingByTargetField.Currency && !mappingByTargetField.Currency.startsWith(FIXED_FIELD_VALUE_PREFIX)) {
     const currencyMappingTablePath = getCurrencyMappingTablePath();
 
     if (!fs.existsSync(currencyMappingTablePath)) {
@@ -1526,7 +1606,21 @@ function prepareGeneratedFiles({
     currencyMappings
   });
   const warnings = Array.isArray(detailRows.issues) ? detailRows.issues.slice() : [];
-  const billDates = parseRequiredBillDates(detailRows);
+  const detailExportRows = buildDetailExportRows(detailRows);
+  const skippedDetailRows = Array.isArray(detailExportRows.skippedRows) ? detailExportRows.skippedRows : [];
+
+  skippedDetailRows.forEach((row) => {
+    warnings.push({
+      type: 'detail-row-skipped',
+      rowNumber: row.sourceRowNumber,
+      creditAmount: row.creditAmount,
+      debitAmount: row.debitAmount
+    });
+  });
+
+  const billDates = detailExportRows.length > 1
+    ? parseRequiredBillDates(detailExportRows)
+    : parseRequiredBillDates(detailRows);
   const dateRangeLabel = buildDateRangeLabel(billDates);
   const detailOutput = buildStatementOutputFilePath({
     kind: 'detail',
@@ -1536,7 +1630,7 @@ function prepareGeneratedFiles({
   });
 
   writeWorkbookRows({
-    rows: detailRows,
+    rows: detailExportRows,
     outputFilePath: detailOutput.outputFilePath
   });
 
@@ -1710,11 +1804,11 @@ function registerFileHandlers() {
       if (generatedFiles.warnings.length) {
         const detailReady = Boolean(generatedFiles.detail);
         const balanceReady = Boolean(generatedFiles.balance);
-        const message = balanceReady
-          ? '明细账单可导出，余额账单可导出，但存在报错，请点击状态框导出报错文件'
-          : generatedFiles.balanceRequested
-            ? '明细账单可导出，余额账单未生成，请点击状态框导出报错文件'
-            : '明细账单可导出，但存在报错，请点击状态框导出报错文件';
+        const message = buildImportWarningMessage({
+          warnings: generatedFiles.warnings,
+          balanceReady,
+          balanceRequested: generatedFiles.balanceRequested
+        });
 
         return createWarningResult({
           step: '导入网银明细文件',
@@ -1785,15 +1879,26 @@ function registerNewAccountHandlers() {
     const bankName = normalizeCell(payload.bankName);
     const location = normalizeCell(payload.location);
     const currency = normalizeCell(payload.currency);
+    const isMultiCurrency = Boolean(payload.isMultiCurrency);
+    const selectedCurrencies = Array.from(
+      new Set(
+        (Array.isArray(payload.currencies) ? payload.currencies : [])
+          .map((value) => normalizeCell(value))
+          .filter((value) => value !== '')
+      )
+    );
     const bankAccount = normalizeCell(payload.bankAccount);
     const openingDate = parseDateValue(payload.openingDate);
     const missingFields = [
       ['银行名称', bankName],
       ['所在地', location],
-      ['币种', currency],
       ['银行账号', bankAccount],
       ['开户日期', normalizeCell(payload.openingDate)]
     ].filter(([, value]) => !value);
+
+    if (!isMultiCurrency && !currency) {
+      missingFields.push(['币种', '']);
+    }
 
     if (missingFields.length) {
       return createErrorResult({
@@ -1801,6 +1906,14 @@ function registerNewAccountHandlers() {
         message: '请完整填写所有必填项',
         errorCode: 'NEW_ACCOUNT_REQUIRED',
         detailLines: [`缺少字段：${missingFields.map(([label]) => label).join('、')}`]
+      });
+    }
+
+    if (isMultiCurrency && selectedCurrencies.length === 0) {
+      return createErrorResult({
+        step: '生成新开账户余额账单',
+        message: '多币种账户至少需要勾选一个币种',
+        errorCode: 'NEW_ACCOUNT_MULTI_CURRENCY_REQUIRED'
       });
     }
 
@@ -1838,14 +1951,16 @@ function registerNewAccountHandlers() {
         bankName,
         location,
         currency,
+        currencies: selectedCurrencies,
         bankAccount,
         openingDate,
         balanceTemplateFields
       });
       const dateRangeLabel = buildDateRangeLabel(generated.billDates);
+      const currencyLabel = isMultiCurrency ? '多币种' : generated.currencies[0];
       const output = buildOutputFilePath({
         kind: 'new-account',
-        outputFileName: `${bankName}${location}${bankAccount}${currency}新开银行账户余额录入${dateRangeLabel}.xlsx`
+        outputFileName: `${bankName}-${location}-${bankAccount}-${currencyLabel}-新开银行账户余额录入-${dateRangeLabel}.xlsx`
       });
 
       writeBalanceWorkbook({
@@ -1887,6 +2002,7 @@ function registerNewAccountHandlers() {
             bankName,
             location,
             currency,
+            currencies: selectedCurrencies,
             bankAccount,
             openingDate: formatDateLabel(openingDate)
           }

@@ -158,6 +158,50 @@ function parseNumericValue(value) {
   return Number(normalized);
 }
 
+function roundAmount(value) {
+  return Number(Number(value).toFixed(2));
+}
+
+function inferEndingBalance({ previousEndBalance, entries, dateLabel }) {
+  const uniqueBalances = Array.from(
+    new Set(
+      entries
+        .filter((entry) => entry.balanceValue !== null)
+        .map((entry) => roundAmount(entry.balanceValue))
+    )
+  );
+
+  if (uniqueBalances.length === 0) {
+    throw new FileValidationError('FILE_READ', `${dateLabel} 未找到期末余额`);
+  }
+
+  if (uniqueBalances.length === 1) {
+    return uniqueBalances[0];
+  }
+
+  if (previousEndBalance === null) {
+    throw new FileValidationError('FILE_READ', `${dateLabel} 存在多个期末余额，且无法推导首日余额`);
+  }
+
+  const creditAmountSum = entries.reduce((sum, entry) => sum + entry.creditAmount, 0);
+  const debitAmountSum = entries.reduce((sum, entry) => sum + entry.debitAmount, 0);
+  const subtractDebitAmount = roundAmount(previousEndBalance + creditAmountSum - debitAmountSum);
+  const addDebitAmount = roundAmount(previousEndBalance + creditAmountSum + debitAmountSum);
+  const subtractMatch = uniqueBalances.find((balance) => Math.abs(balance - subtractDebitAmount) < 0.005);
+
+  if (subtractMatch !== undefined) {
+    return subtractMatch;
+  }
+
+  const addMatch = uniqueBalances.find((balance) => Math.abs(balance - addDebitAmount) < 0.005);
+
+  if (addMatch !== undefined) {
+    return addMatch;
+  }
+
+  throw new FileValidationError('FILE_READ', `${dateLabel} 的期末余额无法根据收支金额推导`);
+}
+
 function sanitizeAmountValue(value) {
   if (value === null || value === undefined || value === '') {
     return '';
@@ -374,7 +418,7 @@ function applyExportFieldFormats(worksheet, rows) {
 
   const numericFields = ['Balance', 'Credit Amount', 'Debit Amount'];
   const dateFields = ['BillDate', 'ValueDate'];
-  const textFields = ['MerchantId', 'Channel'];
+  const textFields = ['MerchantId', 'Channel', 'Currency'];
 
   rows.slice(1).forEach((row, rowIndex) => {
     const sheetRowIndex = rowIndex + 1;
@@ -516,6 +560,7 @@ function buildMappedRows({
   const sourceHeaders = rows[0] || [];
   const sourceIndexByField = new Map();
   const issues = [];
+  const rowMetas = [];
 
   sourceHeaders.forEach((header, index) => {
     const normalizedHeader = normalizeCell(header);
@@ -527,6 +572,10 @@ function buildMappedRows({
   const mappedRows = [orderedTargetFields.slice()];
 
   rows.slice(1).forEach((row, rowIndex) => {
+    rowMetas.push({
+      sourceRowNumber: rowIndex + 2
+    });
+
     const mappedRow = orderedTargetFields.map((targetField) => {
       const mappingValue = normalizeCell(mappingByField[targetField]);
       const isFixedValue = mappingValue.startsWith(FIXED_FIELD_VALUE_PREFIX);
@@ -538,6 +587,10 @@ function buildMappedRows({
       const sourceField = mappingValue;
       const sourceIndex = sourceIndexByField.get(sourceField);
       const rawValue = sourceIndex === undefined ? '' : row[sourceIndex];
+
+      if (targetField === 'Balance') {
+        return sanitizeAmountValue(rawValue);
+      }
 
       if (targetField === 'Credit Amount' || targetField === 'Debit Amount') {
         return sanitizeAmountValue(rawValue);
@@ -576,7 +629,64 @@ function buildMappedRows({
   });
 
   mappedRows.issues = issues;
+  mappedRows.rowMetas = rowMetas;
   return mappedRows;
+}
+
+function buildDetailExportRows(rows) {
+  const sourceHeaderRow = Array.isArray(rows[0]) ? rows[0].slice() : [];
+  const fieldIndexMap = new Map();
+  const rowMetas = Array.isArray(rows.rowMetas) ? rows.rowMetas : [];
+  const balanceIndex = sourceHeaderRow.findIndex((fieldName) => normalizeCell(fieldName) === 'Balance');
+  const headerRow = balanceIndex < 0
+    ? sourceHeaderRow.slice()
+    : sourceHeaderRow.filter((_fieldName, index) => index !== balanceIndex);
+  const exportRows = [headerRow];
+  const skippedRows = [];
+
+  sourceHeaderRow.forEach((fieldName, index) => {
+    const normalizedField = normalizeCell(fieldName);
+
+    if (normalizedField && !fieldIndexMap.has(normalizedField)) {
+      fieldIndexMap.set(normalizedField, index);
+    }
+  });
+
+  const creditAmountIndex = fieldIndexMap.get('Credit Amount');
+  const debitAmountIndex = fieldIndexMap.get('Debit Amount');
+
+  rows.slice(1).forEach((row, index) => {
+    const exportRow = Array.isArray(row) ? row.slice() : [];
+    const creditAmountValue = creditAmountIndex === undefined ? '' : exportRow[creditAmountIndex];
+    const debitAmountValue = debitAmountIndex === undefined ? '' : exportRow[debitAmountIndex];
+    const creditAmountNumeric = parseNumericValue(creditAmountValue);
+    const debitAmountNumeric = parseNumericValue(debitAmountValue);
+    const isCreditAmountZeroOrBlank = normalizeCell(creditAmountValue) === '' || creditAmountNumeric === 0;
+    const isDebitAmountZeroOrBlank = normalizeCell(debitAmountValue) === '' || debitAmountNumeric === 0;
+
+    if (
+      creditAmountIndex !== undefined &&
+      debitAmountIndex !== undefined &&
+      isCreditAmountZeroOrBlank &&
+      isDebitAmountZeroOrBlank
+    ) {
+      skippedRows.push({
+        sourceRowNumber: rowMetas[index]?.sourceRowNumber || index + 2,
+        creditAmount: normalizeCell(creditAmountValue),
+        debitAmount: normalizeCell(debitAmountValue)
+      });
+      return;
+    }
+
+    if (balanceIndex >= 0) {
+      exportRow.splice(balanceIndex, 1);
+    }
+
+    exportRows.push(exportRow);
+  });
+
+  exportRows.skippedRows = skippedRows;
+  return exportRows;
 }
 
 function writeWorkbookRows({ rows, outputFilePath, sheetName = 'COMMON' }) {
@@ -700,8 +810,10 @@ function transformFileToWorkbook({
 
 module.exports = {
   buildMappedRows,
+  buildDetailExportRows,
   FileValidationError,
   FIXED_FIELD_VALUE_PREFIX,
+  inferEndingBalance,
   SUPPORTED_EXTENSIONS,
   ensureSupportedFile,
   extractEnumValuesFromImportedFile,

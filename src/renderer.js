@@ -36,6 +36,9 @@ const state = {
   isBackgroundPaletteOpen: false,
   currentModule: MODULES.statementGenerator.id,
   isModuleMenuOpen: false,
+  currencyOptions: [],
+  selectedNewAccountCurrencies: [],
+  isNewAccountCurrencyDropdownOpen: false,
   isBackgroundSpectrumDragging: false,
   backgroundPicker: {
     hasSelection: false,
@@ -61,6 +64,10 @@ const elements = {
   newAccountBankNameInput: document.getElementById('newAccountBankNameInput'),
   newAccountLocationInput: document.getElementById('newAccountLocationInput'),
   newAccountCurrencyInput: document.getElementById('newAccountCurrencyInput'),
+  newAccountCurrencyDropdownWrap: document.getElementById('newAccountCurrencyDropdownWrap'),
+  newAccountCurrencyDropdownBtn: document.getElementById('newAccountCurrencyDropdownBtn'),
+  newAccountCurrencyDropdownPanel: document.getElementById('newAccountCurrencyDropdownPanel'),
+  newAccountMultiCurrencyCheckbox: document.getElementById('newAccountMultiCurrencyCheckbox'),
   newAccountBankAccountInput: document.getElementById('newAccountBankAccountInput'),
   newAccountOpenDateInput: document.getElementById('newAccountOpenDateInput'),
   appVersion: document.getElementById('appVersion'),
@@ -160,13 +167,16 @@ async function handleExportLastError(target = 'main') {
 }
 
 function isNewAccountFormComplete() {
+  const currencyReady = isNewAccountMultiCurrencyMode()
+    ? state.selectedNewAccountCurrencies.length > 0
+    : String(elements.newAccountCurrencyInput.value || '').trim() !== '';
+
   return [
     elements.newAccountBankNameInput.value,
     elements.newAccountLocationInput.value,
-    elements.newAccountCurrencyInput.value,
     elements.newAccountBankAccountInput.value,
     elements.newAccountOpenDateInput.value
-  ].every((value) => String(value || '').trim() !== '');
+  ].every((value) => String(value || '').trim() !== '') && currencyReady;
 }
 
 function updateNewAccountGenerateAvailability() {
@@ -211,6 +221,123 @@ function closeModuleMenu() {
   state.isModuleMenuOpen = false;
   elements.moduleSwitcherMenu.hidden = true;
   elements.moduleSwitcherBtn.setAttribute('aria-expanded', 'false');
+}
+
+function isNewAccountMultiCurrencyMode() {
+  return elements.newAccountMultiCurrencyCheckbox.checked;
+}
+
+function formatSelectedCurrencySummary(currencies) {
+  if (!currencies.length) {
+    return '\u00A0';
+  }
+
+  if (currencies.length === 1) {
+    return currencies[0];
+  }
+
+  return `已选${currencies.length}项`;
+}
+
+function updateNewAccountCurrencyDropdownLabel() {
+  const selectedCurrencies = state.selectedNewAccountCurrencies.slice();
+  elements.newAccountCurrencyDropdownBtn.textContent = formatSelectedCurrencySummary(selectedCurrencies);
+  elements.newAccountCurrencyDropdownBtn.title = selectedCurrencies.join('、');
+  elements.newAccountCurrencyDropdownBtn.disabled = state.currencyOptions.length === 0;
+}
+
+function closeNewAccountCurrencyDropdown() {
+  state.isNewAccountCurrencyDropdownOpen = false;
+  elements.newAccountCurrencyDropdownPanel.hidden = true;
+  elements.newAccountCurrencyDropdownBtn.classList.remove('is-open');
+  elements.newAccountCurrencyDropdownBtn.setAttribute('aria-expanded', 'false');
+}
+
+function openNewAccountCurrencyDropdown() {
+  if (!isNewAccountMultiCurrencyMode() || state.currencyOptions.length === 0) {
+    return;
+  }
+
+  state.isNewAccountCurrencyDropdownOpen = true;
+  elements.newAccountCurrencyDropdownPanel.hidden = false;
+  elements.newAccountCurrencyDropdownBtn.classList.add('is-open');
+  elements.newAccountCurrencyDropdownBtn.setAttribute('aria-expanded', 'true');
+}
+
+function toggleNewAccountCurrencyDropdown() {
+  if (state.isNewAccountCurrencyDropdownOpen) {
+    closeNewAccountCurrencyDropdown();
+    return;
+  }
+
+  openNewAccountCurrencyDropdown();
+}
+
+function handleNewAccountFormMutation() {
+  updateNewAccountGenerateAvailability();
+  setNewAccountExportAvailability(false);
+  setNewAccountStatus('请完整填写开户信息后点击生成', 'info', {
+    errorReportReady: false,
+    idleTitle: getNewAccountStatusTitle()
+  });
+}
+
+function renderNewAccountCurrencyOptions() {
+  elements.newAccountCurrencyDropdownPanel.replaceChildren();
+  state.selectedNewAccountCurrencies = state.selectedNewAccountCurrencies.filter((currency) => {
+    return state.currencyOptions.includes(currency);
+  });
+
+  if (!state.currencyOptions.length) {
+    const emptyState = document.createElement('div');
+    emptyState.className = 'new-account-currency-option';
+    emptyState.innerHTML = '<span class="new-account-currency-option-text">未读取到币种选项</span>';
+    elements.newAccountCurrencyDropdownPanel.appendChild(emptyState);
+    updateNewAccountCurrencyDropdownLabel();
+    return;
+  }
+
+  state.currencyOptions.forEach((currencyCode) => {
+    const option = document.createElement('label');
+    option.className = 'new-account-currency-option';
+
+    const text = document.createElement('span');
+    text.className = 'new-account-currency-option-text';
+    text.textContent = currencyCode;
+
+    const checkbox = document.createElement('input');
+    checkbox.className = 'new-account-checkbox';
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.selectedNewAccountCurrencies.includes(currencyCode);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) {
+        state.selectedNewAccountCurrencies = Array.from(new Set([...state.selectedNewAccountCurrencies, currencyCode]));
+      } else {
+        state.selectedNewAccountCurrencies = state.selectedNewAccountCurrencies.filter((value) => value !== currencyCode);
+      }
+
+      updateNewAccountCurrencyDropdownLabel();
+      handleNewAccountFormMutation();
+    });
+
+    option.append(text, checkbox);
+    elements.newAccountCurrencyDropdownPanel.appendChild(option);
+  });
+
+  updateNewAccountCurrencyDropdownLabel();
+}
+
+function syncNewAccountCurrencyMode() {
+  const isMultiCurrency = isNewAccountMultiCurrencyMode();
+  elements.newAccountCurrencyInput.hidden = isMultiCurrency;
+  elements.newAccountCurrencyDropdownWrap.hidden = !isMultiCurrency;
+
+  if (!isMultiCurrency) {
+    closeNewAccountCurrencyDropdown();
+    return;
+  }
+
+  updateNewAccountCurrencyDropdownLabel();
 }
 
 function normalizeColorHex(colorHex) {
@@ -774,12 +901,14 @@ function createMappingDialog(payload) {
     row.dataset.templateField = fieldName;
     const isBalanceField = fieldName === 'Balance';
     const isMerchantIdField = fieldName === 'MerchantId';
+    const isCurrencyField = fieldName === 'Currency';
+    const supportsCustomInput = isMerchantIdField || isCurrencyField;
     const savedMapping = savedMap.get(fieldName) || {
       mappedField: isBalanceField ? '无' : '',
       customValue: ''
     };
     const selectOptions = [isBalanceField ? '<option value="无">无</option>' : '<option value=""></option>']
-      .concat(isMerchantIdField ? [`<option value="${MERCHANT_ID_SELF_INPUT_OPTION}">${MERCHANT_ID_SELF_INPUT_OPTION}</option>`] : [])
+      .concat(supportsCustomInput ? [`<option value="${MERCHANT_ID_SELF_INPUT_OPTION}">${MERCHANT_ID_SELF_INPUT_OPTION}</option>`] : [])
       .concat(headerOptions)
       .join('');
     row.innerHTML = `
@@ -787,7 +916,7 @@ function createMappingDialog(payload) {
       <td>
         <div class="mapping-field-editor">
           <select class="mapping-select">${selectOptions}</select>
-          ${isMerchantIdField ? '<input class="mapping-text-input mapping-custom-input" type="text" spellcheck="false" placeholder="请输入固定 MerchantId" />' : ''}
+          ${supportsCustomInput ? `<input class="mapping-text-input mapping-custom-input" type="text" spellcheck="false" placeholder="${isMerchantIdField ? '请输入固定 MerchantId' : '请输入固定 Currency'}" />` : ''}
         </div>
       </td>
     `;
@@ -1041,6 +1170,8 @@ function getNewAccountPayload() {
     bankName: elements.newAccountBankNameInput.value,
     location: elements.newAccountLocationInput.value,
     currency: elements.newAccountCurrencyInput.value,
+    currencies: state.selectedNewAccountCurrencies.slice(),
+    isMultiCurrency: isNewAccountMultiCurrencyMode(),
     bankAccount: elements.newAccountBankAccountInput.value,
     openingDate: elements.newAccountOpenDateInput.value
   };
@@ -1048,6 +1179,9 @@ function getNewAccountPayload() {
 
 function applyNewAccountPreviewState() {
   setCurrentModule(MODULES.newAccountGenerator.id);
+  elements.newAccountMultiCurrencyCheckbox.checked = false;
+  state.selectedNewAccountCurrencies = [];
+  syncNewAccountCurrencyMode();
   elements.newAccountBankNameInput.value = '中国银行';
   elements.newAccountLocationInput.value = '香港';
   elements.newAccountCurrencyInput.value = 'USD';
@@ -1102,9 +1236,15 @@ async function initialize() {
   state.enumFileName = info.enumFileName || '';
   state.accountMappingCount = info.accountMappingCount || 0;
   state.hasErrorReport = Boolean(info.hasErrorReport);
+  state.currencyOptions = Array.isArray(info.currencyOptions) ? info.currencyOptions.slice() : [];
   state.backgroundSettings = cloneBackgroundSettings(info.backgroundConfig);
   state.backgroundDraft = cloneBackgroundSettings(info.backgroundConfig);
   applyBackgroundSettings(state.backgroundSettings);
+  elements.newAccountMultiCurrencyCheckbox.checked = false;
+  state.selectedNewAccountCurrencies = [];
+  renderNewAccountCurrencyOptions();
+  elements.newAccountOpenDateInput.value = '';
+  syncNewAccountCurrencyMode();
   await refreshTemplates();
   setExportAvailability({
     detailEnabled: false,
@@ -1132,6 +1272,13 @@ async function initialize() {
   elements.exportBalanceBtn.addEventListener('click', handleExportBalance);
   elements.newAccountGenerateBtn.addEventListener('click', handleNewAccountGenerate);
   elements.newAccountExportBtn.addEventListener('click', handleNewAccountExport);
+  elements.newAccountCurrencyDropdownBtn.addEventListener('click', () => {
+    toggleNewAccountCurrencyDropdown();
+  });
+  elements.newAccountMultiCurrencyCheckbox.addEventListener('change', () => {
+    syncNewAccountCurrencyMode();
+    handleNewAccountFormMutation();
+  });
   elements.statusBox.addEventListener('click', () => {
     handleExportLastError('main').catch((error) => {
       console.error(error);
@@ -1158,14 +1305,7 @@ async function initialize() {
     elements.newAccountBankAccountInput,
     elements.newAccountOpenDateInput
   ].forEach((input) => {
-    input.addEventListener('input', () => {
-      updateNewAccountGenerateAvailability();
-      setNewAccountExportAvailability(false);
-      setNewAccountStatus('请完整填写开户信息后点击生成', 'info', {
-        errorReportReady: false,
-        idleTitle: getNewAccountStatusTitle()
-      });
-    });
+    input.addEventListener('input', handleNewAccountFormMutation);
   });
   elements.moduleSwitcherBtn.addEventListener('click', () => {
     if (state.isModuleMenuOpen) {
@@ -1258,6 +1398,13 @@ async function initialize() {
 
       closeBackgroundPalette();
     }
+
+    if (
+      state.isNewAccountCurrencyDropdownOpen &&
+      !elements.newAccountCurrencyDropdownWrap.contains(event.target)
+    ) {
+      closeNewAccountCurrencyDropdown();
+    }
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
@@ -1267,6 +1414,10 @@ async function initialize() {
 
       if (state.isBackgroundPaletteOpen) {
         closeBackgroundPalette();
+      }
+
+      if (state.isNewAccountCurrencyDropdownOpen) {
+        closeNewAccountCurrencyDropdown();
       }
     }
   });
@@ -1283,6 +1434,11 @@ async function initialize() {
     }, 120);
   } else if (info.previewModal === 'background-palette') {
     setTimeout(() => {
+      openBackgroundPalette();
+    }, 120);
+  } else if (info.previewModal === 'new-account-palette') {
+    setTimeout(() => {
+      applyNewAccountPreviewState();
       openBackgroundPalette();
     }, 120);
   }

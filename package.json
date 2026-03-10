@@ -1,12 +1,13 @@
 {
   "name": "bank-bill-excel-tool",
-  "version": "1.2.1",
+  "version": "1.2.7",
   "description": "网银账单小助手",
   "main": "src/main.js",
   "author": "OpenAI Codex",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
+    "icon:sync": "node scripts/sync-app-icon.js",
     "dist:win": "electron-builder --win",
     "dist:win:setup": "electron-builder --win nsis",
     "dist:win:portable": "electron-builder --win portable",
@@ -18,7 +19,8 @@
     "appId": "com.openai.bankbillexceltool",
     "productName": "网银账单小助手",
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "build"
     },
     "files": [
       "assets/**/*",
@@ -32,6 +34,7 @@
       "package.json"
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         "nsis",
         "portable"
@@ -41,6 +44,9 @@
       "artifactName": "${productName}-${version}-setup.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "installerHeaderIcon": "build/icon.ico",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
     },
