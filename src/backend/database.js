@@ -243,6 +243,24 @@ class AppDatabase {
     this.setSetting('enum_config', JSON.stringify(enumConfig));
   }
 
+  getBackgroundConfig() {
+    const raw = this.getSetting('background_config');
+
+    if (!raw) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(raw);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  setBackgroundConfig(backgroundConfig) {
+    this.setSetting('background_config', JSON.stringify(backgroundConfig));
+  }
+
   listAccountMappings() {
     return this.db
       .prepare(`

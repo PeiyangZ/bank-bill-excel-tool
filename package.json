@@ -1,6 +1,6 @@
 {
   "name": "bank-bill-excel-tool",
-  "version": "1.0.9",
+  "version": "1.1.0",
   "description": "网银账单小助手",
   "main": "src/main.js",
   "author": "OpenAI Codex",
@@ -12,8 +12,7 @@
     "dist:win:portable": "electron-builder --win portable",
     "preview": "node scripts/render-preview.js",
     "preview:account": "node scripts/render-account-mapping-preview.js",
-    "smoke": "node scripts/smoke-test.js",
-    "init:enum": "node scripts/create-common-enum.js"
+    "smoke": "node scripts/smoke-test.js"
   },
   "build": {
     "appId": "com.openai.bankbillexceltool",
@@ -23,6 +22,7 @@
     },
     "files": [
       "assets/**/*",
+      "COMMON枚举.xlsx",
       "index.html",
       "src/**/*",
       "scripts/**/*",

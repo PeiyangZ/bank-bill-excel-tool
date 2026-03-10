@@ -1,13 +1,17 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, nativeImage } = require('electron');
 const { AppDatabase } = require('./backend/database');
 const {
+  buildMappedRows,
   FileValidationError,
-  extractEnumValuesFromImportedFile,
   extractHeaders,
   loadEnumValues,
-  transformFileToWorkbook
+  normalizeCell,
+  parseDateValue,
+  parseNumericValue,
+  writeBalanceWorkbook,
+  writeWorkbookRows
 } = require('./backend/file-service');
 const { appendLog } = require('./backend/logger');
 
@@ -25,7 +29,22 @@ if (process.platform === 'win32') {
 
 let mainWindow = null;
 let database = null;
-let lastGeneratedFile = null;
+let lastGeneratedExports = {
+  detail: null,
+  balance: null
+};
+
+const DEFAULT_BACKGROUND_COLOR = '#efe8da';
+const BUNDLED_ENUM_FILE_NAME = 'COMMON枚举.xlsx';
+const MISSING_ENUM_MESSAGE = '内置网银账单枚举表缺失，请检查安装包';
+const BACKGROUND_IMAGE_LIMITS = Object.freeze({
+  maxSizeBytes: 5 * 1024 * 1024,
+  minWidth: 1200,
+  minHeight: 700,
+  maxWidth: 4096,
+  maxHeight: 4096
+});
+const SUPPORTED_BACKGROUND_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 
 function pad(value) {
   return String(value).padStart(2, '0');
@@ -41,6 +60,10 @@ function ensureStorageRoot() {
   return storageRoot;
 }
 
+function getBackgroundAssetsDir() {
+  return path.join(ensureStorageRoot(), 'background');
+}
+
 function getImportedEnumConfig() {
   const enumConfig = database.getEnumConfig();
 
@@ -51,18 +74,558 @@ function getImportedEnumConfig() {
   return enumConfig;
 }
 
+function getBundledEnumPath() {
+  const appRoot = app.getAppPath();
+  const preferredPath = path.join(appRoot, BUNDLED_ENUM_FILE_NAME);
+  const fallbackPath = path.join(appRoot, 'assets', BUNDLED_ENUM_FILE_NAME);
+
+  if (fs.existsSync(preferredPath)) {
+    return preferredPath;
+  }
+
+  if (fs.existsSync(fallbackPath)) {
+    return fallbackPath;
+  }
+
+  return preferredPath;
+}
+
+function getEnumConfig() {
+  const bundledEnumPath = getBundledEnumPath();
+
+  if (fs.existsSync(bundledEnumPath)) {
+    return {
+      filePath: bundledEnumPath,
+      sourceFileName: BUNDLED_ENUM_FILE_NAME,
+      isBundled: true
+    };
+  }
+
+  const importedEnumConfig = getImportedEnumConfig();
+
+  return importedEnumConfig
+    ? {
+        ...importedEnumConfig,
+        isBundled: false
+      }
+    : null;
+}
+
+function normalizeBackgroundColor(colorHex) {
+  const normalized = String(colorHex || '').trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(normalized) ? normalized : DEFAULT_BACKGROUND_COLOR;
+}
+
+function getStoredBackgroundConfig() {
+  const backgroundConfig = database.getBackgroundConfig() || {};
+  const filePath = typeof backgroundConfig.filePath === 'string' ? backgroundConfig.filePath : '';
+  const fileExists = Boolean(filePath && fs.existsSync(filePath));
+
+  return {
+    colorHex: normalizeBackgroundColor(backgroundConfig.colorHex),
+    filePath: fileExists ? filePath : '',
+    sourceFileName: fileExists
+      ? String(backgroundConfig.sourceFileName || path.basename(filePath))
+      : ''
+  };
+}
+
+function getMimeTypeByExtension(filePath) {
+  switch (path.extname(filePath).toLowerCase()) {
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.webp':
+      return 'image/webp';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+function fileToDataUrl(filePath) {
+  const mimeType = getMimeTypeByExtension(filePath);
+  const buffer = fs.readFileSync(filePath);
+  return `data:${mimeType};base64,${buffer.toString('base64')}`;
+}
+
+function buildBackgroundPayload(backgroundConfig) {
+  const normalized = getStoredBackgroundConfig();
+  const payload = backgroundConfig
+    ? {
+        colorHex: normalizeBackgroundColor(backgroundConfig.colorHex),
+        filePath:
+          backgroundConfig.filePath && fs.existsSync(backgroundConfig.filePath)
+            ? backgroundConfig.filePath
+            : '',
+        sourceFileName: backgroundConfig.sourceFileName || ''
+      }
+    : normalized;
+
+  return {
+    colorHex: payload.colorHex,
+    filePath: payload.filePath,
+    sourceFileName: payload.sourceFileName,
+    imageDataUrl: payload.filePath ? fileToDataUrl(payload.filePath) : ''
+  };
+}
+
+function removeStoredBackgroundFiles() {
+  const backgroundDir = getBackgroundAssetsDir();
+
+  if (!fs.existsSync(backgroundDir)) {
+    return;
+  }
+
+  for (const fileName of fs.readdirSync(backgroundDir)) {
+    const filePath = path.join(backgroundDir, fileName);
+
+    if (fs.statSync(filePath).isFile()) {
+      fs.unlinkSync(filePath);
+    }
+  }
+}
+
+function backgroundFileDialogFilters() {
+  return [
+    {
+      name: '图片',
+      extensions: ['png', 'jpg', 'jpeg', 'webp']
+    }
+  ];
+}
+
+function validateBackgroundImage(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+
+  if (!SUPPORTED_BACKGROUND_IMAGE_EXTENSIONS.has(extension)) {
+    throw new FileValidationError('FILE_TYPE', '背景图片仅支持 PNG、JPG、JPEG、WEBP 格式');
+  }
+
+  if (!fs.existsSync(filePath)) {
+    throw new FileValidationError('FILE_READ', '背景图片不存在或不可读，请重新选择');
+  }
+
+  const stats = fs.statSync(filePath);
+
+  if (!stats.isFile() || stats.size === 0) {
+    throw new FileValidationError('FILE_READ', '背景图片为空或不可读，请重新选择');
+  }
+
+  if (stats.size > BACKGROUND_IMAGE_LIMITS.maxSizeBytes) {
+    throw new FileValidationError('FILE_SIZE', '背景图片不能超过 5MB');
+  }
+
+  const image = nativeImage.createFromPath(filePath);
+
+  if (image.isEmpty()) {
+    throw new FileValidationError('FILE_READ', '背景图片为空或不可读，请重新选择');
+  }
+
+  const { width, height } = image.getSize();
+
+  if (width < BACKGROUND_IMAGE_LIMITS.minWidth || height < BACKGROUND_IMAGE_LIMITS.minHeight) {
+    throw new FileValidationError(
+      'IMAGE_DIMENSION',
+      `背景图片分辨率至少需要 ${BACKGROUND_IMAGE_LIMITS.minWidth}×${BACKGROUND_IMAGE_LIMITS.minHeight}`
+    );
+  }
+
+  if (width > BACKGROUND_IMAGE_LIMITS.maxWidth || height > BACKGROUND_IMAGE_LIMITS.maxHeight) {
+    throw new FileValidationError(
+      'IMAGE_DIMENSION',
+      `背景图片分辨率不能超过 ${BACKGROUND_IMAGE_LIMITS.maxWidth}×${BACKGROUND_IMAGE_LIMITS.maxHeight}`
+    );
+  }
+
+  return {
+    width,
+    height,
+    sizeBytes: stats.size
+  };
+}
+
+function saveBackgroundConfig(payload = {}) {
+  const currentBackgroundConfig = getStoredBackgroundConfig();
+  const colorHex = normalizeBackgroundColor(payload.colorHex);
+  const imageSourcePath = String(payload.imageSourcePath || '');
+  const keepExistingImage = Boolean(payload.keepExistingImage);
+  let nextFilePath = '';
+  let nextSourceFileName = '';
+
+  if (imageSourcePath) {
+    validateBackgroundImage(imageSourcePath);
+    const imageBuffer = fs.readFileSync(imageSourcePath);
+    const extension = path.extname(imageSourcePath).toLowerCase();
+    const backgroundDir = getBackgroundAssetsDir();
+    const storedFilePath = path.join(backgroundDir, `app-background${extension}`);
+
+    fs.mkdirSync(backgroundDir, { recursive: true });
+    removeStoredBackgroundFiles();
+    fs.writeFileSync(storedFilePath, imageBuffer);
+
+    nextFilePath = storedFilePath;
+    nextSourceFileName = path.basename(imageSourcePath);
+  } else if (keepExistingImage && currentBackgroundConfig.filePath) {
+    nextFilePath = currentBackgroundConfig.filePath;
+    nextSourceFileName = currentBackgroundConfig.sourceFileName;
+  } else {
+    removeStoredBackgroundFiles();
+  }
+
+  const backgroundConfig = {
+    colorHex,
+    filePath: nextFilePath,
+    sourceFileName: nextSourceFileName
+  };
+
+  database.setBackgroundConfig(backgroundConfig);
+  return buildBackgroundPayload(backgroundConfig);
+}
+
 function getToday() {
   const now = new Date();
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 }
 
-function buildOutputFilePath(templateName) {
+function formatDateLabel(date) {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function buildTargetFields(enumValues) {
+  return ['Balance'].concat(
+    enumValues.filter((value) => normalizeCell(value) !== '' && normalizeCell(value) !== 'Balance')
+  );
+}
+
+function getBalanceTemplatePath() {
+  const appRoot = app.getAppPath();
+  const preferredPath = path.join(appRoot, 'assets', '余额账单模版.xlsx');
+  const fallbackPath = path.join(appRoot, '余额账单模版.xlsx');
+
+  if (fs.existsSync(preferredPath)) {
+    return preferredPath;
+  }
+
+  return fallbackPath;
+}
+
+function normalizeMappingRows({ template, mappings, enumValues }) {
+  const targetFields = buildTargetFields(enumValues);
+  const targetFieldSet = new Set(targetFields);
+  const sourceFieldSet = new Set(template.headers.map((header) => normalizeCell(header)));
+  const currentOrientationScore = mappings.filter((mapping) => targetFieldSet.has(mapping.templateField)).length;
+  const legacyOrientationScore = mappings.filter((mapping) => {
+    return sourceFieldSet.has(normalizeCell(mapping.templateField)) && targetFieldSet.has(mapping.mappedField);
+  }).length;
+  const currentMappings = legacyOrientationScore > currentOrientationScore
+    ? mappings
+        .map((mapping) => ({
+          templateField: mapping.mappedField,
+          mappedField: mapping.templateField
+        }))
+        .filter((mapping) => targetFieldSet.has(mapping.templateField))
+    : mappings.filter((mapping) => targetFieldSet.has(mapping.templateField));
+  const savedMap = new Map(
+    currentMappings.map((mapping) => [mapping.templateField, normalizeCell(mapping.mappedField)])
+  );
+
+  return targetFields.map((fieldName) => ({
+    templateField: fieldName,
+    mappedField: fieldName === 'Balance'
+      ? savedMap.get(fieldName) || '无'
+      : savedMap.get(fieldName) === '无'
+        ? ''
+        : savedMap.get(fieldName) || ''
+  }));
+}
+
+function getTemplateMappingConfig(templateId) {
+  const templatePayload = database.getTemplateMappings(templateId);
+
+  if (!templatePayload) {
+    return null;
+  }
+
+  const enumConfig = getEnumConfig();
+
+  if (!enumConfig) {
+    throw new FileValidationError('FILE_READ', MISSING_ENUM_MESSAGE);
+  }
+
+  const enumValues = loadEnumValues(enumConfig.filePath);
+  const mappings = normalizeMappingRows({
+    template: templatePayload.template,
+    mappings: templatePayload.mappings,
+    enumValues
+  });
+
+  return {
+    template: templatePayload.template,
+    enumValues,
+    targetFields: buildTargetFields(enumValues),
+    mappings
+  };
+}
+
+function buildDateRangeLabel(billDates) {
+  const sortedDates = Array.from(new Set(billDates)).sort();
+
+  if (sortedDates.length === 0) {
+    return '';
+  }
+
+  if (sortedDates.length === 1) {
+    return sortedDates[0];
+  }
+
+  return `${sortedDates[0]}~${sortedDates[sortedDates.length - 1]}`;
+}
+
+function buildOutputFilePath({ kind, templateName, dateRangeLabel }) {
   const date = getToday();
-  const outputFolder = path.join(ensureStorageRoot(), 'exports', date);
+  const outputFolder = path.join(ensureStorageRoot(), 'exports', date, kind);
+  const safeDateLabel = dateRangeLabel || date;
+  const outputFileName = `${templateName}-Balance-${safeDateLabel}.xlsx`;
   return {
     date,
     outputFolder,
-    outputFilePath: path.join(outputFolder, `${templateName}-COMMON-${date}.xlsx`)
+    outputFileName,
+    outputFilePath: path.join(outputFolder, outputFileName)
+  };
+}
+
+function clearGeneratedExports() {
+  lastGeneratedExports = {
+    detail: null,
+    balance: null
+  };
+}
+
+function buildFieldIndexMap(headerRow) {
+  const fieldIndexMap = new Map();
+
+  headerRow.forEach((fieldName, index) => {
+    const normalizedField = normalizeCell(fieldName);
+
+    if (normalizedField && !fieldIndexMap.has(normalizedField)) {
+      fieldIndexMap.set(normalizedField, index);
+    }
+  });
+
+  return fieldIndexMap;
+}
+
+function getMappedFieldValue(row, fieldIndexMap, fieldName) {
+  const fieldIndex = fieldIndexMap.get(fieldName);
+  return fieldIndex === undefined ? '' : row[fieldIndex];
+}
+
+function parseRequiredBillDates(detailRows) {
+  const fieldIndexMap = buildFieldIndexMap(detailRows[0] || []);
+  const billDateIndex = fieldIndexMap.get('BillDate');
+
+  if (billDateIndex === undefined) {
+    throw new FileValidationError('FILE_READ', '当前模版必须映射 BillDate 字段');
+  }
+
+  const billDates = [];
+
+  detailRows.slice(1).forEach((row) => {
+    const rawValue = row[billDateIndex];
+    const normalizedValue = normalizeCell(rawValue);
+
+    if (!normalizedValue) {
+      return;
+    }
+
+    const parsedDate = parseDateValue(rawValue);
+
+    if (!parsedDate) {
+      throw new FileValidationError('FILE_READ', `账单日期存在无效值：${normalizedValue}`);
+    }
+
+    billDates.push(formatDateLabel(parsedDate));
+  });
+
+  if (!billDates.length) {
+    throw new FileValidationError('FILE_READ', '导入文件中未找到有效的 BillDate');
+  }
+
+  return billDates;
+}
+
+function ensureNumericValue(rawValue, { fieldName, dateLabel, allowBlank = false }) {
+  const normalizedValue = normalizeCell(rawValue);
+
+  if (!normalizedValue) {
+    return allowBlank ? null : 0;
+  }
+
+  const parsedValue = parseNumericValue(rawValue);
+
+  if (parsedValue === null) {
+    throw new FileValidationError('FILE_READ', `${dateLabel} 的 ${fieldName} 不是有效数字`);
+  }
+
+  return parsedValue;
+}
+
+function roundAmount(value) {
+  return Number(value.toFixed(2));
+}
+
+function pickSingleTextValue(values, fieldName) {
+  const uniqueValues = Array.from(
+    new Set(values.map((value) => normalizeCell(value)).filter((value) => value !== ''))
+  );
+
+  if (uniqueValues.length > 1) {
+    throw new FileValidationError('FILE_READ', `${fieldName} 存在多个不同取值，无法生成余额账单`);
+  }
+
+  return uniqueValues[0] || '';
+}
+
+function splitTemplateName(templateName) {
+  const [bankName, ...locationParts] = String(templateName || '').split('-');
+
+  return {
+    bankName: bankName || '',
+    location: locationParts.join('-')
+  };
+}
+
+function deriveBalanceRecords({ detailRows, templateName }) {
+  const fieldIndexMap = buildFieldIndexMap(detailRows[0] || []);
+  const balanceIndex = fieldIndexMap.get('Balance');
+  const billDateIndex = fieldIndexMap.get('BillDate');
+
+  if (balanceIndex === undefined) {
+    throw new FileValidationError('FILE_READ', '当前模版未配置 Balance 字段，无法生成余额账单');
+  }
+
+  if (billDateIndex === undefined) {
+    throw new FileValidationError('FILE_READ', '当前模版必须映射 BillDate 字段');
+  }
+
+  const groupedRows = new Map();
+  const bankNameParts = splitTemplateName(templateName);
+  const currencies = [];
+  const bankAccounts = [];
+
+  detailRows.slice(1).forEach((row) => {
+    const billDateRaw = row[billDateIndex];
+    const normalizedBillDate = normalizeCell(billDateRaw);
+
+    if (!normalizedBillDate) {
+      return;
+    }
+
+    const parsedDate = parseDateValue(billDateRaw);
+
+    if (!parsedDate) {
+      throw new FileValidationError('FILE_READ', `账单日期存在无效值：${normalizedBillDate}`);
+    }
+
+    const dateLabel = formatDateLabel(parsedDate);
+    const balanceValue = ensureNumericValue(row[balanceIndex], {
+      fieldName: 'Balance',
+      dateLabel,
+      allowBlank: true
+    });
+    const creditAmount = ensureNumericValue(getMappedFieldValue(row, fieldIndexMap, 'Credit Amount'), {
+      fieldName: 'Credit Amount',
+      dateLabel,
+      allowBlank: false
+    });
+    const debitAmount = ensureNumericValue(getMappedFieldValue(row, fieldIndexMap, 'Debit Amount'), {
+      fieldName: 'Debit Amount',
+      dateLabel,
+      allowBlank: false
+    });
+    const currency = getMappedFieldValue(row, fieldIndexMap, 'Currency');
+    const bankAccount = getMappedFieldValue(row, fieldIndexMap, 'MerchantId');
+
+    currencies.push(currency);
+    bankAccounts.push(bankAccount);
+
+    if (!groupedRows.has(dateLabel)) {
+      groupedRows.set(dateLabel, []);
+    }
+
+    groupedRows.get(dateLabel).push({
+      balanceValue,
+      creditAmount,
+      debitAmount
+    });
+  });
+
+  const dateKeys = Array.from(groupedRows.keys()).sort();
+
+  if (!dateKeys.length) {
+    throw new FileValidationError('FILE_READ', '导入文件中未找到可用于余额账单的账单日期');
+  }
+
+  const currency = pickSingleTextValue(currencies, 'Currency');
+  const bankAccount = pickSingleTextValue(bankAccounts, '银行账号');
+  const records = [];
+  let previousEndBalance = null;
+
+  dateKeys.forEach((dateLabel) => {
+    const entries = groupedRows.get(dateLabel);
+    const uniqueBalances = Array.from(
+      new Set(
+        entries
+          .filter((entry) => entry.balanceValue !== null)
+          .map((entry) => roundAmount(entry.balanceValue))
+      )
+    );
+    let endBalance = null;
+
+    if (uniqueBalances.length === 0) {
+      throw new FileValidationError('FILE_READ', `${dateLabel} 未找到期末余额`);
+    }
+
+    if (uniqueBalances.length === 1) {
+      [endBalance] = uniqueBalances;
+    } else {
+      if (previousEndBalance === null) {
+        throw new FileValidationError('FILE_READ', `${dateLabel} 存在多个期末余额，且无法推导首日余额`);
+      }
+
+      const amount = roundAmount(
+        previousEndBalance
+          + entries.reduce((sum, entry) => sum + entry.creditAmount, 0)
+          + entries.reduce((sum, entry) => sum + entry.debitAmount, 0)
+      );
+      const matchedBalance = uniqueBalances.find((balance) => Math.abs(balance - amount) < 0.005);
+
+      if (matchedBalance === undefined) {
+        throw new FileValidationError('FILE_READ', `${dateLabel} 的期末余额无法根据收支金额推导`);
+      }
+
+      endBalance = matchedBalance;
+    }
+
+    previousEndBalance = endBalance;
+    records.push([
+      bankNameParts.bankName,
+      bankNameParts.location,
+      currency,
+      bankAccount,
+      dateLabel,
+      '',
+      '',
+      endBalance,
+      ''
+    ]);
+  });
+
+  return {
+    records,
+    billDates: dateKeys
   };
 }
 
@@ -152,14 +715,86 @@ function registerWindowHandlers() {
 
 function registerAppHandlers() {
   ipcMain.handle('app:get-info', () => {
-    const enumConfig = getImportedEnumConfig();
+    const enumConfig = getEnumConfig();
     return {
       version: app.getVersion(),
       storageRoot: ensureStorageRoot(),
       hasEnum: Boolean(enumConfig),
       enumFileName: enumConfig ? enumConfig.sourceFileName : '',
       accountMappingCount: database.listAccountMappings().length,
+      backgroundConfig: buildBackgroundPayload(),
       previewModal: process.env.APP_PREVIEW_MODAL || ''
+    };
+  });
+}
+
+function registerBackgroundHandlers() {
+  ipcMain.handle('background:select-file', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile'],
+      filters: backgroundFileDialogFilters()
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return { status: 'cancelled' };
+    }
+
+    const selectedPath = result.filePaths[0];
+
+    try {
+      const imageInfo = validateBackgroundImage(selectedPath);
+
+      return {
+        status: 'success',
+        background: {
+          sourcePath: selectedPath,
+          sourceFileName: path.basename(selectedPath),
+          imageDataUrl: fileToDataUrl(selectedPath),
+          ...imageInfo
+        }
+      };
+    } catch (error) {
+      if (error instanceof FileValidationError) {
+        return {
+          status: 'error',
+          message: error.message
+        };
+      }
+
+      throw error;
+    }
+  });
+
+  ipcMain.handle('background:save', (_event, payload) => {
+    try {
+      const backgroundConfig = saveBackgroundConfig(payload);
+      return {
+        status: 'success',
+        message: backgroundConfig.filePath ? '背景已更新' : '背景色已更新',
+        backgroundConfig
+      };
+    } catch (error) {
+      if (error instanceof FileValidationError) {
+        return {
+          status: 'error',
+          message: error.message
+        };
+      }
+
+      throw error;
+    }
+  });
+
+  ipcMain.handle('background:reset', () => {
+    const backgroundConfig = saveBackgroundConfig({
+      colorHex: DEFAULT_BACKGROUND_COLOR,
+      keepExistingImage: false
+    });
+
+    return {
+      status: 'success',
+      message: '已恢复默认背景',
+      backgroundConfig
     };
   });
 }
@@ -217,57 +852,6 @@ function validateAccountMappings(mappings) {
   };
 }
 
-function registerEnumHandlers() {
-  ipcMain.handle('enum:import', async () => {
-    const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ['openFile'],
-      filters: [
-        {
-          name: 'Excel',
-          extensions: ['xlsx']
-        }
-      ]
-    });
-
-    if (result.canceled || result.filePaths.length === 0) {
-      return { status: 'cancelled' };
-    }
-
-    const selectedPath = result.filePaths[0];
-
-    try {
-      extractEnumValuesFromImportedFile(selectedPath);
-      const enumDir = path.join(ensureStorageRoot(), 'enum');
-      const targetPath = path.join(enumDir, '网银账单枚举表.xlsx');
-
-      fs.mkdirSync(enumDir, { recursive: true });
-      if (path.resolve(selectedPath) !== path.resolve(targetPath)) {
-        fs.copyFileSync(selectedPath, targetPath);
-      }
-
-      database.setEnumConfig({
-        filePath: targetPath,
-        sourceFileName: path.basename(selectedPath)
-      });
-
-      return {
-        status: 'success',
-        message: `网银账单枚举表导入成功：${path.basename(selectedPath)}`,
-        enumFileName: path.basename(selectedPath)
-      };
-    } catch (error) {
-      if (error instanceof FileValidationError) {
-        return {
-          status: 'error',
-          message: error.message
-        };
-      }
-
-      throw error;
-    }
-  });
-}
-
 function registerAccountMappingHandlers() {
   ipcMain.handle('account-mapping:list', () => {
     return {
@@ -289,6 +873,68 @@ function registerAccountMappingHandlers() {
       message: '账户映射保存成功'
     };
   });
+}
+
+function validateTemplateMappings({ template, mappings, enumValues }) {
+  const targetFields = buildTargetFields(enumValues);
+  const targetFieldSet = new Set(targetFields);
+  const sourceFieldSet = new Set(template.headers.map((header) => normalizeCell(header)));
+  const mappingByTarget = new Map();
+
+  mappings.forEach((mapping) => {
+    const targetField = normalizeCell(mapping.templateField);
+    const sourceField = normalizeCell(mapping.mappedField);
+
+    if (!targetFieldSet.has(targetField)) {
+      return;
+    }
+
+    mappingByTarget.set(targetField, sourceField);
+  });
+
+  const cleanedMappings = [];
+  const selectedSourceFields = new Set();
+
+  targetFields.forEach((targetField) => {
+    const selectedSourceField = mappingByTarget.get(targetField) || '';
+    const normalizedSourceField = targetField === 'Balance'
+      ? selectedSourceField || '无'
+      : selectedSourceField === '无'
+        ? ''
+        : selectedSourceField;
+
+    if (targetField === 'Balance' && normalizedSourceField === '无') {
+      cleanedMappings.push({
+        templateField: targetField,
+        mappedField: '无'
+      });
+      return;
+    }
+
+    if (!normalizedSourceField) {
+      cleanedMappings.push({
+        templateField: targetField,
+        mappedField: ''
+      });
+      return;
+    }
+
+    if (!sourceFieldSet.has(normalizedSourceField)) {
+      throw new FileValidationError('FILE_READ', `映射字段不存在：${normalizedSourceField}`);
+    }
+
+    if (selectedSourceFields.has(normalizedSourceField)) {
+      throw new FileValidationError('FILE_READ', '同一个模版字段不可重复映射，请重新确认');
+    }
+
+    selectedSourceFields.add(normalizedSourceField);
+    cleanedMappings.push({
+      templateField: targetField,
+      mappedField: normalizedSourceField
+    });
+  });
+
+  return cleanedMappings;
 }
 
 function registerTemplateHandlers() {
@@ -337,36 +983,34 @@ function registerTemplateHandlers() {
   });
 
   ipcMain.handle('template:get-mappings', (_event, templateId) => {
-    const mappingSet = database.getTemplateMappings(templateId);
-
-    if (!mappingSet) {
+    if (!getEnumConfig()) {
       return {
         status: 'error',
-        message: '未找到对应模版'
-      };
-    }
-
-    const enumConfig = getImportedEnumConfig();
-
-    if (!enumConfig) {
-      return {
-        status: 'error',
-        message: '请先导入网银账单枚举表'
+        message: MISSING_ENUM_MESSAGE
       };
     }
 
     try {
+      const mappingConfig = getTemplateMappingConfig(templateId);
+
+      if (!mappingConfig) {
+        return {
+          status: 'error',
+          message: '未找到对应模版'
+        };
+      }
+
       return {
         status: 'success',
-        template: buildTemplateSummary(mappingSet.template),
-        mappings: mappingSet.mappings,
-        enumValues: loadEnumValues(enumConfig.filePath)
+        template: buildTemplateSummary(mappingConfig.template),
+        targetFields: mappingConfig.targetFields,
+        mappings: mappingConfig.mappings
       };
     } catch (error) {
       if (error instanceof FileValidationError) {
         return {
           status: 'error',
-          message: '网银账单枚举表为空或不可读，请重新导入'
+          message: '内置网银账单枚举表为空或不可读，请检查安装包'
         };
       }
 
@@ -375,33 +1019,176 @@ function registerTemplateHandlers() {
   });
 
   ipcMain.handle('template:save-mappings', (_event, payload) => {
-    const { templateId, mappings } = payload;
-    const selectedValues = mappings
-      .map((mapping) => mapping.mappedField.trim())
-      .filter((value) => value !== '');
-    const uniqueValues = new Set(selectedValues);
+    try {
+      const enumConfig = getEnumConfig();
+      const template = database.getTemplate(payload.templateId);
 
-    if (selectedValues.length !== uniqueValues.size) {
+      if (!enumConfig) {
+        return {
+          status: 'error',
+          message: MISSING_ENUM_MESSAGE
+        };
+      }
+
+      if (!template) {
+        return {
+          status: 'error',
+          message: '未找到对应模版'
+        };
+      }
+
+      const mappings = validateTemplateMappings({
+        template,
+        mappings: payload.mappings,
+        enumValues: loadEnumValues(enumConfig.filePath)
+      });
+
+      database.saveMappings(payload.templateId, mappings);
       return {
-        status: 'error',
-        message: '校验不通过，请重新确认映射关系'
+        status: 'success',
+        message: '模版映射保存成功'
       };
+    } catch (error) {
+      if (error instanceof FileValidationError) {
+        return {
+          status: 'error',
+          message: error.message
+        };
+      }
+
+      throw error;
+    }
+  });
+}
+
+function buildMappedFieldLookup(mappings) {
+  return mappings.reduce((accumulator, mapping) => {
+    accumulator[mapping.templateField] = mapping.mappedField;
+    return accumulator;
+  }, {});
+}
+
+function prepareGeneratedFiles({ template, mappings, inputFilePath }) {
+  const selectedMappings = mappings.filter((mapping) => {
+    if (mapping.templateField === 'Balance') {
+      return mapping.mappedField && mapping.mappedField !== '无';
     }
 
-    database.saveMappings(templateId, mappings);
-    return {
-      status: 'success',
-      message: '模版成功生成！'
-    };
+    return mapping.mappedField !== '';
   });
+
+  if (!selectedMappings.length) {
+    throw new FileValidationError('FILE_READ', '当前模版尚未设置映射关系');
+  }
+
+  const mappingByTargetField = buildMappedFieldLookup(selectedMappings);
+
+  if (!mappingByTargetField.BillDate) {
+    throw new FileValidationError('FILE_READ', '当前模版必须映射 BillDate 字段');
+  }
+
+  const orderedTargetFields = selectedMappings.map((mapping) => mapping.templateField);
+  const accountMappingByBankId = database.listAccountMappings().reduce((accumulator, mapping) => {
+    accumulator[mapping.bankAccountId] = mapping.clearingAccountId;
+    return accumulator;
+  }, {});
+  const detailRows = buildMappedRows({
+    inputFilePath,
+    orderedTargetFields,
+    mappingByField: mappingByTargetField,
+    accountMappingByBankId
+  });
+  const billDates = parseRequiredBillDates(detailRows);
+  const dateRangeLabel = buildDateRangeLabel(billDates);
+  const detailOutput = buildOutputFilePath({
+    kind: 'detail',
+    templateName: template.name,
+    dateRangeLabel
+  });
+
+  writeWorkbookRows({
+    rows: detailRows,
+    outputFilePath: detailOutput.outputFilePath
+  });
+
+  const result = {
+    detail: {
+      filePath: detailOutput.outputFilePath,
+      fileName: detailOutput.outputFileName
+    },
+    balance: null,
+    message: '明细账单可导出'
+  };
+
+  if (mappingByTargetField.Balance) {
+    const balanceTemplatePath = getBalanceTemplatePath();
+
+    if (!fs.existsSync(balanceTemplatePath)) {
+      throw new FileValidationError('FILE_READ', '未找到余额账单模版，请确认文件已放入 assets 目录');
+    }
+
+    const balanceResult = deriveBalanceRecords({
+      detailRows,
+      templateName: template.name
+    });
+    const balanceOutput = buildOutputFilePath({
+      kind: 'balance',
+      templateName: template.name,
+      dateRangeLabel: buildDateRangeLabel(balanceResult.billDates)
+    });
+
+    writeBalanceWorkbook({
+      templateFilePath: balanceTemplatePath,
+      records: balanceResult.records,
+      outputFilePath: balanceOutput.outputFilePath
+    });
+
+    result.balance = {
+      filePath: balanceOutput.outputFilePath,
+      fileName: balanceOutput.outputFileName
+    };
+    result.message = '明细账单可导出，余额账单可导出';
+  }
+
+  return result;
+}
+
+async function exportGeneratedFile(generatedFile, emptyMessage) {
+  if (!generatedFile || !generatedFile.filePath || !fs.existsSync(generatedFile.filePath)) {
+    return {
+      status: 'error',
+      message: emptyMessage
+    };
+  }
+
+  const saveResult = await dialog.showSaveDialog(mainWindow, {
+    defaultPath: generatedFile.fileName,
+    filters: [
+      {
+        name: 'Excel',
+        extensions: ['xlsx']
+      }
+    ]
+  });
+
+  if (saveResult.canceled || !saveResult.filePath) {
+    return { status: 'cancelled' };
+  }
+
+  fs.copyFileSync(generatedFile.filePath, saveResult.filePath);
+  return {
+    status: 'success',
+    message: '文件导出成功',
+    filePath: saveResult.filePath
+  };
 }
 
 function registerFileHandlers() {
   ipcMain.handle('file:import', async (_event, templateId) => {
-    if (!getImportedEnumConfig()) {
+    if (!getEnumConfig()) {
       return {
         status: 'error',
-        message: '请先导入网银账单枚举表'
+        message: MISSING_ENUM_MESSAGE
       };
     }
 
@@ -412,66 +1199,45 @@ function registerFileHandlers() {
       };
     }
 
-    const templatePayload = database.getTemplateMappings(templateId);
-
-    if (!templatePayload) {
-      return {
-        status: 'error',
-        message: '未找到对应模版'
-      };
-    }
-
-    const usableMappings = templatePayload.mappings.filter(
-      (mapping) => mapping.mappedField.trim() !== ''
-    );
-
-    if (usableMappings.length === 0) {
-      return {
-        status: 'error',
-        message: '当前模版尚未设置映射关系'
-      };
-    }
-
-    const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ['openFile'],
-      filters: fileDialogFilters()
-    });
-
-    if (result.canceled || result.filePaths.length === 0) {
-      return { status: 'cancelled' };
-    }
-
-    const inputFilePath = result.filePaths[0];
-    const mappingByField = usableMappings.reduce((accumulator, item) => {
-      accumulator[item.templateField] = item.mappedField;
-      return accumulator;
-    }, {});
-    const merchantSourceFields = usableMappings
-      .filter((mapping) => mapping.mappedField.trim() === 'MerchantId')
-      .map((mapping) => mapping.templateField);
-    const accountMappingByBankId = database.listAccountMappings().reduce((accumulator, mapping) => {
-      accumulator[mapping.bankAccountId] = mapping.clearingAccountId;
-      return accumulator;
-    }, {});
-
     try {
-      const { outputFilePath, date } = buildOutputFilePath(templatePayload.template.name);
-      transformFileToWorkbook({
-        inputFilePath,
-        mappingByField,
-        merchantSourceFields,
-        accountMappingByBankId,
-        outputFilePath
+      const templateConfig = getTemplateMappingConfig(templateId);
+
+      if (!templateConfig) {
+        return {
+          status: 'error',
+          message: '未找到对应模版'
+        };
+      }
+
+      const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ['openFile'],
+        filters: fileDialogFilters()
       });
-      lastGeneratedFile = outputFilePath;
+
+      if (result.canceled || result.filePaths.length === 0) {
+        return { status: 'cancelled' };
+      }
+
+      const inputFilePath = result.filePaths[0];
+      const generatedFiles = prepareGeneratedFiles({
+        template: templateConfig.template,
+        mappings: templateConfig.mappings,
+        inputFilePath
+      });
+      lastGeneratedExports = {
+        detail: generatedFiles.detail,
+        balance: generatedFiles.balance
+      };
 
       return {
         status: 'success',
-        message: '可以导出文件',
-        outputFilePath,
-        outputDate: date
+        message: generatedFiles.message,
+        detailReady: Boolean(generatedFiles.detail),
+        balanceReady: Boolean(generatedFiles.balance)
       };
     } catch (error) {
+      clearGeneratedExports();
+
       if (error instanceof FileValidationError) {
         return {
           status: 'error',
@@ -488,34 +1254,12 @@ function registerFileHandlers() {
     }
   });
 
-  ipcMain.handle('file:export', async () => {
-    if (!lastGeneratedFile || !fs.existsSync(lastGeneratedFile)) {
-      return {
-        status: 'error',
-        message: '暂无可导出的文件'
-      };
-    }
+  ipcMain.handle('file:export-detail', () => {
+    return exportGeneratedFile(lastGeneratedExports.detail, '暂无可导出的明细账单');
+  });
 
-    const saveResult = await dialog.showSaveDialog(mainWindow, {
-      defaultPath: path.basename(lastGeneratedFile),
-      filters: [
-        {
-          name: 'Excel',
-          extensions: ['xlsx']
-        }
-      ]
-    });
-
-    if (saveResult.canceled || !saveResult.filePath) {
-      return { status: 'cancelled' };
-    }
-
-    fs.copyFileSync(lastGeneratedFile, saveResult.filePath);
-    return {
-      status: 'success',
-      message: '文件导出成功',
-      filePath: saveResult.filePath
-    };
+  ipcMain.handle('file:export-balance', () => {
+    return exportGeneratedFile(lastGeneratedExports.balance, '暂无可导出的余额账单');
   });
 }
 
@@ -526,7 +1270,7 @@ app.whenReady().then(() => {
 
   registerWindowHandlers();
   registerAppHandlers();
-  registerEnumHandlers();
+  registerBackgroundHandlers();
   registerAccountMappingHandlers();
   registerTemplateHandlers();
   registerFileHandlers();

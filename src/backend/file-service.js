@@ -105,16 +105,14 @@ function loadEnumValues(enumFilePath) {
       return;
     }
 
-    row.forEach((cell) => {
-      const value = normalizeCell(cell);
+    const value = normalizeCell(row[0]);
 
-      if (!value || seen.has(value)) {
-        return;
-      }
+    if (!value || seen.has(value)) {
+      return;
+    }
 
-      seen.add(value);
-      values.push(value);
-    });
+    seen.add(value);
+    values.push(value);
   });
 
   return values;
@@ -235,7 +233,7 @@ function applyExportFieldFormats(worksheet, rows) {
     fieldIndexMap.get(normalizedHeader).push(index);
   });
 
-  const numericFields = ['Credit Amount', 'Debit Amount'];
+  const numericFields = ['Balance', 'Credit Amount', 'Debit Amount'];
   const dateFields = ['BillDate', 'ValueDate'];
   const textFields = ['MerchantId', 'Channel'];
 
@@ -295,6 +293,89 @@ function applyExportFieldFormats(worksheet, rows) {
   });
 }
 
+function buildMappedRows({
+  inputFilePath,
+  orderedTargetFields,
+  mappingByField,
+  accountMappingByBankId = {}
+}) {
+  const rows = readRows(inputFilePath);
+  const sourceHeaders = rows[0] || [];
+  const sourceIndexByField = new Map();
+
+  sourceHeaders.forEach((header, index) => {
+    const normalizedHeader = normalizeCell(header);
+
+    if (normalizedHeader && !sourceIndexByField.has(normalizedHeader)) {
+      sourceIndexByField.set(normalizedHeader, index);
+    }
+  });
+  const mappedRows = [orderedTargetFields.slice()];
+
+  rows.slice(1).forEach((row) => {
+    const mappedRow = orderedTargetFields.map((targetField) => {
+      const sourceField = normalizeCell(mappingByField[targetField]);
+      const sourceIndex = sourceIndexByField.get(sourceField);
+      const rawValue = sourceIndex === undefined ? '' : row[sourceIndex];
+
+      if (targetField === 'MerchantId') {
+        const originalValue = normalizeCell(rawValue);
+
+        if (!originalValue) {
+          return '';
+        }
+
+        return Object.prototype.hasOwnProperty.call(accountMappingByBankId, originalValue)
+          ? String(accountMappingByBankId[originalValue])
+          : rawValue;
+      }
+
+      return rawValue ?? '';
+    });
+
+    mappedRows.push(mappedRow);
+  });
+
+  return mappedRows;
+}
+
+function writeWorkbookRows({ rows, outputFilePath, sheetName = 'COMMON' }) {
+  const workbook = XLSX.utils.book_new();
+  const worksheet = XLSX.utils.aoa_to_sheet(rows);
+  applyExportFieldFormats(worksheet, rows);
+
+  XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+  fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
+  XLSX.writeFile(workbook, outputFilePath);
+
+  return outputFilePath;
+}
+
+function writeBalanceWorkbook({
+  templateFilePath,
+  records,
+  outputFilePath
+}) {
+  const workbook = XLSX.readFile(templateFilePath, {
+    cellNF: true,
+    cellStyles: true,
+    raw: true
+  });
+  const sheetName = workbook.SheetNames[0];
+
+  if (!sheetName) {
+    throw new FileValidationError('FILE_READ', '余额账单模版不可读，请重新确认');
+  }
+
+  const worksheet = workbook.Sheets[sheetName];
+  XLSX.utils.sheet_add_aoa(worksheet, records, { origin: 'A2' });
+  worksheet['!ref'] = `A1:I${Math.max(records.length + 1, 2)}`;
+
+  fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
+  XLSX.writeFile(workbook, outputFilePath);
+  return outputFilePath;
+}
+
 function transformFileToWorkbook({
   inputFilePath,
   mappingByField,
@@ -302,51 +383,44 @@ function transformFileToWorkbook({
   accountMappingByBankId = {},
   outputFilePath
 }) {
-  const rows = readRows(inputFilePath);
-  const headerRow = rows[0] || [];
-  const merchantFieldSet = new Set(merchantSourceFields.map((field) => normalizeCell(field)));
-  const merchantIndexes = [];
-  const updatedHeaderRow = headerRow.map((cell, columnIndex) => {
-    const original = normalizeCell(cell);
+  const orderedTargetFields = [];
 
-    if (merchantFieldSet.has(original)) {
-      merchantIndexes.push(columnIndex);
+  Object.entries(mappingByField).forEach(([sourceField, targetField]) => {
+    if (!targetField) {
+      return;
     }
 
-    return mappingByField[original] || original;
+    orderedTargetFields.push(targetField);
   });
 
-  rows[0] = updatedHeaderRow;
+  const normalizedMappingByField = Object.entries(mappingByField).reduce((accumulator, [sourceField, targetField]) => {
+    if (!targetField) {
+      return accumulator;
+    }
 
-  if (merchantIndexes.length) {
-    rows.slice(1).forEach((row) => {
-      merchantIndexes.forEach((columnIndex) => {
-        const originalValue = normalizeCell(row[columnIndex]);
+    accumulator[targetField] = sourceField;
+    return accumulator;
+  }, {});
 
-        if (!originalValue) {
-          row[columnIndex] = '';
-          return;
-        }
-
-        row[columnIndex] = Object.prototype.hasOwnProperty.call(accountMappingByBankId, originalValue)
-          ? String(accountMappingByBankId[originalValue])
-          : String(originalValue);
-      });
-    });
+  if (!orderedTargetFields.includes('MerchantId') && merchantSourceFields.length) {
+    orderedTargetFields.push('MerchantId');
   }
 
-  const workbook = XLSX.utils.book_new();
-  const worksheet = XLSX.utils.aoa_to_sheet(rows);
-  applyExportFieldFormats(worksheet, rows);
+  const rows = buildMappedRows({
+    inputFilePath,
+    orderedTargetFields,
+    mappingByField: normalizedMappingByField,
+    accountMappingByBankId
+  });
 
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'COMMON');
-  fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
-  XLSX.writeFile(workbook, outputFilePath);
-
-  return outputFilePath;
+  return writeWorkbookRows({
+    rows,
+    outputFilePath
+  });
 }
 
 module.exports = {
+  buildMappedRows,
   FileValidationError,
   SUPPORTED_EXTENSIONS,
   ensureSupportedFile,
@@ -357,5 +431,7 @@ module.exports = {
   parseDateValue,
   parseNumericValue,
   readRows,
-  transformFileToWorkbook
+  transformFileToWorkbook,
+  writeBalanceWorkbook,
+  writeWorkbookRows
 };

@@ -1,15 +1,50 @@
+const DEFAULT_BACKGROUND_SETTINGS = Object.freeze({
+  colorHex: '#efe8da',
+  imageDataUrl: '',
+  filePath: '',
+  sourceFileName: '',
+  sourcePath: ''
+});
+const DEFAULT_SPECTRUM_PICK_COLOR = '#ffffff';
+const BACKGROUND_FILE_HINT = '支持 PNG/JPG/JPEG/WEBP，大小不超过 5MB，建议使用横版高清图片';
+const MODULES = Object.freeze({
+  statementGenerator: {
+    id: 'statement-generator',
+    name: '网银账单生成'
+  },
+  newAccountGenerator: {
+    id: 'new-account-generator',
+    name: '新开账户生成网银账单'
+  }
+});
+
 const state = {
   templates: [],
   selectedTemplateId: '',
-  canExport: false,
+  canExportDetail: false,
+  canExportBalance: false,
   isMaximized: false,
   hasEnum: false,
-  enumFileName: ''
+  enumFileName: '',
+  backgroundSettings: { ...DEFAULT_BACKGROUND_SETTINGS },
+  backgroundDraft: { ...DEFAULT_BACKGROUND_SETTINGS },
+  isBackgroundPaletteOpen: false,
+  currentModule: MODULES.statementGenerator.id,
+  isModuleMenuOpen: false,
+  isBackgroundSpectrumDragging: false,
+  backgroundPicker: {
+    hasSelection: false,
+    x: 0,
+    y: 0,
+    colorHex: DEFAULT_SPECTRUM_PICK_COLOR
+  }
 };
 
 const elements = {
+  appShell: document.getElementById('appShell'),
   importFileBtn: document.getElementById('importFileBtn'),
-  exportFileBtn: document.getElementById('exportFileBtn'),
+  exportDetailBtn: document.getElementById('exportDetailBtn'),
+  exportBalanceBtn: document.getElementById('exportBalanceBtn'),
   importTemplateBtn: document.getElementById('importTemplateBtn'),
   manageTemplateBtn: document.getElementById('manageTemplateBtn'),
   accountMappingBtn: document.getElementById('accountMappingBtn'),
@@ -19,7 +54,22 @@ const elements = {
   modalRoot: document.getElementById('modalRoot'),
   minimizeBtn: document.getElementById('minimizeBtn'),
   maximizeBtn: document.getElementById('maximizeBtn'),
-  closeBtn: document.getElementById('closeBtn')
+  closeBtn: document.getElementById('closeBtn'),
+  moduleSwitcherBtn: document.getElementById('moduleSwitcherBtn'),
+  moduleSwitcherMenu: document.getElementById('moduleSwitcherMenu'),
+  currentModuleName: document.getElementById('currentModuleName'),
+  statementModulePanel: document.getElementById('statementModulePanel'),
+  newAccountModulePanel: document.getElementById('newAccountModulePanel'),
+  backgroundTool: document.getElementById('backgroundTool'),
+  backgroundPaletteBtn: document.getElementById('backgroundPaletteBtn'),
+  backgroundPalettePanel: document.getElementById('backgroundPalettePanel'),
+  backgroundSpectrumArea: document.getElementById('backgroundSpectrumArea'),
+  backgroundSpectrumCanvas: document.getElementById('backgroundSpectrumCanvas'),
+  backgroundSpectrumCrosshair: document.getElementById('backgroundSpectrumCrosshair'),
+  backgroundSelectedColorSwatch: document.getElementById('backgroundSelectedColorSwatch'),
+  backgroundImportBtn: document.getElementById('backgroundImportBtn'),
+  backgroundDoneBtn: document.getElementById('backgroundDoneBtn'),
+  backgroundResetBtn: document.getElementById('backgroundResetBtn')
 };
 
 function setStatus(message, tone = 'info') {
@@ -29,13 +79,396 @@ function setStatus(message, tone = 'info') {
 
 function getEnumStatusMessage() {
   return state.hasEnum
-    ? `已导入枚举表：${state.enumFileName}（点击可覆盖）`
-    : '请导入网银账单枚举表';
+    ? `已加载内置枚举表：${state.enumFileName || 'COMMON枚举.xlsx'}`
+    : '内置网银账单枚举表缺失，请检查安装包';
 }
 
-function setExportEnabled(enabled) {
-  state.canExport = enabled;
-  elements.exportFileBtn.disabled = !enabled;
+function getStatusBoxTitle(accountMappingCount) {
+  const mappingSummary = accountMappingCount
+    ? `当前账户映射条数：${accountMappingCount}`
+    : '当前未设置账户映射';
+
+  return `${mappingSummary}；应用已内置 COMMON 枚举表`;
+}
+
+function setExportAvailability({ detailEnabled = state.canExportDetail, balanceEnabled = state.canExportBalance }) {
+  state.canExportDetail = detailEnabled;
+  state.canExportBalance = balanceEnabled;
+  elements.exportDetailBtn.disabled = !detailEnabled;
+  elements.exportBalanceBtn.disabled = !balanceEnabled;
+}
+
+function setCurrentModule(moduleId) {
+  state.currentModule = moduleId;
+  const isStatementModule = moduleId === MODULES.statementGenerator.id;
+
+  elements.currentModuleName.textContent = isStatementModule
+    ? MODULES.statementGenerator.name
+    : MODULES.newAccountGenerator.name;
+  elements.statementModulePanel.hidden = !isStatementModule;
+  elements.newAccountModulePanel.hidden = isStatementModule;
+
+  Array.from(elements.moduleSwitcherMenu.querySelectorAll('.module-option')).forEach((button) => {
+    button.classList.toggle('is-active', button.dataset.module === moduleId);
+  });
+}
+
+function openModuleMenu() {
+  state.isModuleMenuOpen = true;
+  elements.moduleSwitcherMenu.hidden = false;
+  elements.moduleSwitcherBtn.setAttribute('aria-expanded', 'true');
+}
+
+function closeModuleMenu() {
+  state.isModuleMenuOpen = false;
+  elements.moduleSwitcherMenu.hidden = true;
+  elements.moduleSwitcherBtn.setAttribute('aria-expanded', 'false');
+}
+
+function normalizeColorHex(colorHex) {
+  const normalized = String(colorHex || '').trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(normalized) ? normalized : DEFAULT_BACKGROUND_SETTINGS.colorHex;
+}
+
+function cloneBackgroundSettings(backgroundSettings = DEFAULT_BACKGROUND_SETTINGS) {
+  return {
+    colorHex: normalizeColorHex(backgroundSettings.colorHex),
+    imageDataUrl: String(backgroundSettings.imageDataUrl || ''),
+    filePath: String(backgroundSettings.filePath || ''),
+    sourceFileName: String(backgroundSettings.sourceFileName || ''),
+    sourcePath: String(backgroundSettings.sourcePath || '')
+  };
+}
+
+function clampColorChannel(value) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function mixRgb(fromRgb, toRgb, ratio) {
+  const safeRatio = Math.max(0, Math.min(1, ratio));
+  return {
+    r: clampColorChannel(fromRgb.r + (toRgb.r - fromRgb.r) * safeRatio),
+    g: clampColorChannel(fromRgb.g + (toRgb.g - fromRgb.g) * safeRatio),
+    b: clampColorChannel(fromRgb.b + (toRgb.b - fromRgb.b) * safeRatio)
+  };
+}
+
+function hexToRgb(colorHex) {
+  const normalized = normalizeColorHex(colorHex);
+  return {
+    r: parseInt(normalized.slice(1, 3), 16),
+    g: parseInt(normalized.slice(3, 5), 16),
+    b: parseInt(normalized.slice(5, 7), 16)
+  };
+}
+
+function mixColor(fromHex, toHex, ratio) {
+  const from = hexToRgb(fromHex);
+  const to = hexToRgb(toHex);
+  return mixRgb(from, to, ratio);
+}
+
+function rgbToCss(rgb, alpha) {
+  if (alpha === undefined) {
+    return `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
+  }
+
+  return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
+}
+
+function rgbToHex(rgb) {
+  return `#${[rgb.r, rgb.g, rgb.b]
+    .map((channel) => clampColorChannel(channel).toString(16).padStart(2, '0'))
+    .join('')}`;
+}
+
+function hslToRgb(hue, saturation, lightness) {
+  const h = ((hue % 360) + 360) % 360;
+  const s = Math.max(0, Math.min(1, saturation));
+  const l = Math.max(0, Math.min(1, lightness));
+  const chroma = (1 - Math.abs(2 * l - 1)) * s;
+  const segment = h / 60;
+  const second = chroma * (1 - Math.abs((segment % 2) - 1));
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+
+  if (segment >= 0 && segment < 1) {
+    red = chroma;
+    green = second;
+  } else if (segment < 2) {
+    red = second;
+    green = chroma;
+  } else if (segment < 3) {
+    green = chroma;
+    blue = second;
+  } else if (segment < 4) {
+    green = second;
+    blue = chroma;
+  } else if (segment < 5) {
+    red = second;
+    blue = chroma;
+  } else {
+    red = chroma;
+    blue = second;
+  }
+
+  const match = l - chroma / 2;
+
+  return {
+    r: clampColorChannel((red + match) * 255),
+    g: clampColorChannel((green + match) * 255),
+    b: clampColorChannel((blue + match) * 255)
+  };
+}
+
+function getSpectrumColorAtPosition(x, y, width, height) {
+  const safeWidth = Math.max(width - 1, 1);
+  const safeHeight = Math.max(height - 1, 1);
+  const hue = (x / safeWidth) * 360;
+  const baseColor = hslToRgb(hue, 1, 0.5);
+  const middleY = safeHeight / 2;
+
+  if (y <= middleY) {
+    return mixRgb({ r: 255, g: 255, b: 255 }, baseColor, y / Math.max(middleY, 1));
+  }
+
+  return mixRgb(
+    baseColor,
+    { r: 0, g: 0, b: 0 },
+    (y - middleY) / Math.max(safeHeight - middleY, 1)
+  );
+}
+
+function drawBackgroundSpectrum() {
+  const canvas = elements.backgroundSpectrumCanvas;
+  const context = canvas.getContext('2d');
+  const { width, height } = canvas;
+  const imageData = context.createImageData(width, height);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const rgb = getSpectrumColorAtPosition(x, y, width, height);
+      const offset = (y * width + x) * 4;
+
+      imageData.data[offset] = rgb.r;
+      imageData.data[offset + 1] = rgb.g;
+      imageData.data[offset + 2] = rgb.b;
+      imageData.data[offset + 3] = 255;
+    }
+  }
+
+  context.putImageData(imageData, 0, 0);
+}
+
+function updateSelectedColorSwatch(colorHex = DEFAULT_SPECTRUM_PICK_COLOR) {
+  elements.backgroundSelectedColorSwatch.style.background = normalizeColorHex(colorHex);
+}
+
+function resetBackgroundPickerSelection() {
+  state.backgroundPicker = {
+    hasSelection: false,
+    x: 0,
+    y: 0,
+    colorHex: DEFAULT_SPECTRUM_PICK_COLOR
+  };
+  elements.backgroundSpectrumCrosshair.hidden = true;
+  updateSelectedColorSwatch(DEFAULT_SPECTRUM_PICK_COLOR);
+}
+
+function setBackgroundSpectrumSelection(x, y, colorHex) {
+  state.backgroundPicker = {
+    hasSelection: true,
+    x,
+    y,
+    colorHex
+  };
+  elements.backgroundSpectrumCrosshair.hidden = false;
+  elements.backgroundSpectrumCrosshair.style.left = `${x}px`;
+  elements.backgroundSpectrumCrosshair.style.top = `${y}px`;
+  updateSelectedColorSwatch(colorHex);
+}
+
+function pickBackgroundColorFromClientPoint(clientX, clientY) {
+  const rect = elements.backgroundSpectrumArea.getBoundingClientRect();
+
+  if (!rect.width || !rect.height) {
+    return;
+  }
+
+  const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+  const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
+  const canvasX = Math.round((x / rect.width) * (elements.backgroundSpectrumCanvas.width - 1));
+  const canvasY = Math.round((y / rect.height) * (elements.backgroundSpectrumCanvas.height - 1));
+  const colorHex = rgbToHex(
+    getSpectrumColorAtPosition(
+      canvasX,
+      canvasY,
+      elements.backgroundSpectrumCanvas.width,
+      elements.backgroundSpectrumCanvas.height
+    )
+  );
+
+  setBackgroundSpectrumSelection(x, y, colorHex);
+  state.backgroundDraft.colorHex = colorHex;
+  applyBackgroundSettings(state.backgroundDraft);
+}
+
+function buildBackgroundStyle(backgroundSettings) {
+  const normalized = cloneBackgroundSettings(backgroundSettings);
+  const baseColor = hexToRgb(normalized.colorHex);
+
+  if (normalized.imageDataUrl) {
+    return {
+      backgroundColor: rgbToCss(mixColor(normalized.colorHex, '#fff8ec', 0.3)),
+      backgroundImage: [
+        'radial-gradient(circle at top left, rgba(255, 255, 255, 0.72), transparent 30%)',
+        `radial-gradient(circle at bottom right, ${rgbToCss(baseColor, 0.24)} 0%, transparent 34%)`,
+        `linear-gradient(180deg, ${rgbToCss(baseColor, 0.18)} 0%, ${rgbToCss(baseColor, 0.3)} 100%)`,
+        `url("${normalized.imageDataUrl}")`
+      ].join(', '),
+      backgroundSize: 'auto, auto, auto, cover',
+      backgroundPosition: 'center, center, center, center',
+      backgroundRepeat: 'no-repeat, no-repeat, no-repeat, no-repeat'
+    };
+  }
+
+  return {
+    backgroundColor: rgbToCss(mixColor(normalized.colorHex, '#ffffff', 0.66)),
+    backgroundImage: [
+      'radial-gradient(circle at top left, rgba(255, 255, 255, 0.75), transparent 30%)',
+      `radial-gradient(circle at bottom right, ${rgbToCss(baseColor, 0.18)} 0%, transparent 30%)`,
+      `linear-gradient(160deg, ${rgbToCss(mixColor(normalized.colorHex, '#ffffff', 0.56))} 0%, ${rgbToCss(baseColor)} 48%, ${rgbToCss(mixColor(normalized.colorHex, '#fffaf2', 0.74))} 100%)`
+    ].join(', '),
+    backgroundSize: 'auto, auto, auto',
+    backgroundPosition: 'center, center, center',
+    backgroundRepeat: 'no-repeat, no-repeat, no-repeat'
+  };
+}
+
+function updateBackgroundControls(backgroundSettings) {
+  const normalized = cloneBackgroundSettings(backgroundSettings);
+  const triggerFill = normalized.imageDataUrl
+    ? `linear-gradient(135deg, ${rgbToCss(hexToRgb(normalized.colorHex), 0.72)} 0%, rgba(255, 255, 255, 0.92) 100%)`
+    : normalized.colorHex;
+  const importTitle = normalized.sourceFileName
+    ? `${BACKGROUND_FILE_HINT}\n当前背景：${normalized.sourceFileName}`
+    : BACKGROUND_FILE_HINT;
+
+  elements.backgroundPaletteBtn.style.setProperty('--palette-trigger-fill', triggerFill);
+  elements.backgroundImportBtn.title = importTitle;
+}
+
+function applyBackgroundSettings(backgroundSettings) {
+  const normalized = cloneBackgroundSettings(backgroundSettings);
+  const style = buildBackgroundStyle(normalized);
+
+  elements.appShell.style.backgroundColor = style.backgroundColor;
+  elements.appShell.style.backgroundImage = style.backgroundImage;
+  elements.appShell.style.backgroundSize = style.backgroundSize;
+  elements.appShell.style.backgroundPosition = style.backgroundPosition;
+  elements.appShell.style.backgroundRepeat = style.backgroundRepeat;
+  document.body.style.background = rgbToCss(mixColor(normalized.colorHex, '#ffffff', 0.74));
+  updateBackgroundControls(normalized);
+}
+
+function openBackgroundPalette() {
+  state.backgroundDraft = cloneBackgroundSettings(state.backgroundSettings);
+  state.isBackgroundPaletteOpen = true;
+  elements.backgroundPalettePanel.hidden = false;
+  elements.backgroundPaletteBtn.classList.add('is-active');
+  resetBackgroundPickerSelection();
+  applyBackgroundSettings(state.backgroundDraft);
+}
+
+function closeBackgroundPalette({ revert = true } = {}) {
+  if (!state.isBackgroundPaletteOpen) {
+    return;
+  }
+
+  state.isBackgroundPaletteOpen = false;
+  elements.backgroundPalettePanel.hidden = true;
+  elements.backgroundPaletteBtn.classList.remove('is-active');
+  state.isBackgroundSpectrumDragging = false;
+  resetBackgroundPickerSelection();
+
+  if (revert) {
+    state.backgroundDraft = cloneBackgroundSettings(state.backgroundSettings);
+    applyBackgroundSettings(state.backgroundSettings);
+    return;
+  }
+
+  state.backgroundDraft = cloneBackgroundSettings(state.backgroundSettings);
+}
+
+async function handleBackgroundImportFile() {
+  const result = await window.desktopApi.background.selectFile();
+
+  if (result.status === 'cancelled') {
+    return;
+  }
+
+  if (result.status !== 'success') {
+    setStatus(result.message, 'error');
+    openModal(createAlertDialog(result.message));
+    return;
+  }
+
+  state.backgroundDraft = cloneBackgroundSettings({
+    ...state.backgroundDraft,
+    imageDataUrl: result.background.imageDataUrl,
+    filePath: '',
+    sourceFileName: result.background.sourceFileName,
+    sourcePath: result.background.sourcePath
+  });
+
+  applyBackgroundSettings(state.backgroundDraft);
+  setStatus(`已选择背景文件：${result.background.sourceFileName}`, 'success');
+}
+
+async function handleBackgroundSave() {
+  const result = await window.desktopApi.background.save({
+    colorHex: state.backgroundDraft.colorHex,
+    imageSourcePath: state.backgroundDraft.sourcePath,
+    keepExistingImage: !state.backgroundDraft.sourcePath && Boolean(state.backgroundDraft.filePath)
+  });
+
+  if (result.status !== 'success') {
+    setStatus(result.message, 'error');
+    openModal(createAlertDialog(result.message));
+    return;
+  }
+
+  state.backgroundSettings = cloneBackgroundSettings(result.backgroundConfig);
+  applyBackgroundSettings(state.backgroundSettings);
+  closeBackgroundPalette({ revert: false });
+  setStatus(result.message, 'success');
+}
+
+function handleBackgroundReset() {
+  openModal(
+    createConfirmDialog({
+      message: '确认恢复默认背景？当前自定义颜色和背景图会被清除。',
+      confirmText: '确认重置',
+      cancelText: '取消',
+      onConfirm: async () => {
+        const result = await window.desktopApi.background.reset();
+
+        closeModal();
+
+        if (result.status !== 'success') {
+          setStatus(result.message, 'error');
+          openModal(createAlertDialog(result.message));
+          return;
+        }
+
+        state.backgroundSettings = cloneBackgroundSettings(result.backgroundConfig);
+        applyBackgroundSettings(state.backgroundSettings);
+        closeBackgroundPalette({ revert: false });
+        setStatus(result.message, 'success');
+      }
+    })
+  );
 }
 
 function closeModal() {
@@ -87,6 +520,14 @@ function createConfirmDialog({ message, confirmText, cancelText, onConfirm }) {
   return overlay;
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
 function updateTemplateSelect() {
   const previous = state.selectedTemplateId;
   elements.templateSelect.innerHTML = '';
@@ -136,7 +577,7 @@ function renderTemplateTableRows(tableBody) {
     row.innerHTML = `
       <td>${template.name}</td>
       <td class="action-cell">
-        <button class="text-action" type="button" data-action="manage">管理模版</button>
+        <button class="text-action" type="button" data-action="manage">修改</button>
         <button class="text-action danger" type="button" data-action="delete">删除</button>
       </td>
     `;
@@ -226,31 +667,28 @@ function createMappingDialog(payload) {
 
   const tbody = dialog.querySelector('tbody');
   const savedMap = new Map(payload.mappings.map((item) => [item.templateField, item.mappedField]));
+  const headerOptions = payload.template.headers.map((header) => {
+    const escapedHeader = escapeHtml(header || '(空白字段)');
+    const value = escapeHtml(header);
+    return `<option value="${value}">${escapedHeader}</option>`;
+  });
 
-  payload.template.headers.forEach((header) => {
+  payload.targetFields.forEach((fieldName) => {
     const row = document.createElement('tr');
-    const selectOptions = ['<option value=""></option>']
-      .concat(
-        payload.enumValues.map((value) => {
-          const escaped = value
-            .replaceAll('&', '&amp;')
-            .replaceAll('<', '&lt;')
-            .replaceAll('>', '&gt;')
-            .replaceAll('"', '&quot;');
-          return `<option value="${escaped}">${escaped}</option>`;
-        })
-      )
+    const isBalanceField = fieldName === 'Balance';
+    const selectOptions = [isBalanceField ? '<option value="无">无</option>' : '<option value=""></option>']
+      .concat(headerOptions)
       .join('');
     row.innerHTML = `
-      <td>${header || '(空白字段)'}</td>
+      <td>${escapeHtml(fieldName)}</td>
       <td>
         <select class="mapping-select">${selectOptions}</select>
       </td>
     `;
 
     const select = row.querySelector('select');
-    select.value = savedMap.get(header) || '';
-    select.dataset.templateField = header;
+    select.value = savedMap.get(fieldName) || (isBalanceField ? '无' : '');
+    select.dataset.templateField = fieldName;
     tbody.appendChild(row);
   });
 
@@ -378,9 +816,7 @@ function createAccountMappingDialog(payload) {
     if (result.status === 'success') {
       const info = await window.desktopApi.app.getInfo();
       setStatus(result.message, 'success');
-      elements.statusBox.title = info.accountMappingCount
-        ? `当前账户映射条数：${info.accountMappingCount}，点击可导入或覆盖网银账单枚举表`
-        : '点击可导入或覆盖网银账单枚举表';
+      elements.statusBox.title = getStatusBoxTitle(info.accountMappingCount);
     } else {
       setStatus(result.message, 'error');
     }
@@ -418,7 +854,7 @@ async function handleOpenAccountMappings() {
 
 async function handleImportFile() {
   if (!state.hasEnum) {
-    await handleImportEnum();
+    setStatus(getEnumStatusMessage(), 'error');
     return;
   }
 
@@ -432,28 +868,25 @@ async function handleImportFile() {
   setStatus(result.message, result.status === 'success' ? 'success' : 'error');
 
   if (result.status === 'success') {
-    setExportEnabled(true);
+    setExportAvailability({
+      detailEnabled: Boolean(result.detailReady),
+      balanceEnabled: Boolean(result.balanceReady)
+    });
   }
 }
 
-async function handleImportEnum() {
-  const result = await window.desktopApi.enums.importEnum();
+async function handleExportDetail() {
+  const result = await window.desktopApi.files.exportDetail();
 
   if (result.status === 'cancelled') {
     return;
   }
 
-  if (result.status === 'success') {
-    state.hasEnum = true;
-    state.enumFileName = result.enumFileName;
-    setExportEnabled(false);
-  }
-
   setStatus(result.message, result.status === 'success' ? 'success' : 'error');
 }
 
-async function handleExportFile() {
-  const result = await window.desktopApi.files.exportFile();
+async function handleExportBalance() {
+  const result = await window.desktopApi.files.exportBalance();
 
   if (result.status === 'cancelled') {
     return;
@@ -464,13 +897,23 @@ async function handleExportFile() {
 
 async function initialize() {
   const info = await window.desktopApi.app.getInfo();
+  drawBackgroundSpectrum();
+  resetBackgroundPickerSelection();
   elements.appVersion.textContent = info.version;
   state.hasEnum = info.hasEnum;
   state.enumFileName = info.enumFileName || '';
+  state.backgroundSettings = cloneBackgroundSettings(info.backgroundConfig);
+  state.backgroundDraft = cloneBackgroundSettings(info.backgroundConfig);
+  applyBackgroundSettings(state.backgroundSettings);
   await refreshTemplates();
-  setExportEnabled(false);
-  setStatus(getEnumStatusMessage());
-  elements.statusBox.title = '点击可导入或覆盖网银账单枚举表';
+  setExportAvailability({
+    detailEnabled: false,
+    balanceEnabled: false
+  });
+  setCurrentModule(MODULES.statementGenerator.id);
+  closeModuleMenu();
+  setStatus(getEnumStatusMessage(), state.hasEnum ? 'info' : 'error');
+  elements.statusBox.title = getStatusBoxTitle(info.accountMappingCount);
 
   elements.importTemplateBtn.addEventListener('click', handleImportTemplate);
   elements.manageTemplateBtn.addEventListener('click', () => {
@@ -478,11 +921,73 @@ async function initialize() {
   });
   elements.accountMappingBtn.addEventListener('click', handleOpenAccountMappings);
   elements.importFileBtn.addEventListener('click', handleImportFile);
-  elements.exportFileBtn.addEventListener('click', handleExportFile);
-  elements.statusBox.addEventListener('click', handleImportEnum);
+  elements.exportDetailBtn.addEventListener('click', handleExportDetail);
+  elements.exportBalanceBtn.addEventListener('click', handleExportBalance);
   elements.templateSelect.addEventListener('change', (event) => {
     state.selectedTemplateId = event.target.value;
+    setExportAvailability({
+      detailEnabled: false,
+      balanceEnabled: false
+    });
   });
+  elements.moduleSwitcherBtn.addEventListener('click', () => {
+    if (state.isModuleMenuOpen) {
+      closeModuleMenu();
+      return;
+    }
+
+    openModuleMenu();
+  });
+  Array.from(elements.moduleSwitcherMenu.querySelectorAll('.module-option')).forEach((button) => {
+    button.addEventListener('click', () => {
+      setCurrentModule(button.dataset.module);
+      closeModuleMenu();
+    });
+  });
+  elements.backgroundPaletteBtn.addEventListener('click', () => {
+    if (state.isBackgroundPaletteOpen) {
+      closeBackgroundPalette();
+      return;
+    }
+
+    openBackgroundPalette();
+  });
+  elements.backgroundSpectrumArea.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    state.isBackgroundSpectrumDragging = true;
+    elements.backgroundSpectrumArea.setPointerCapture?.(event.pointerId);
+    pickBackgroundColorFromClientPoint(event.clientX, event.clientY);
+  });
+  elements.backgroundSpectrumArea.addEventListener('pointermove', (event) => {
+    if (!state.isBackgroundSpectrumDragging) {
+      return;
+    }
+
+    pickBackgroundColorFromClientPoint(event.clientX, event.clientY);
+  });
+  elements.backgroundSpectrumArea.addEventListener('pointerup', (event) => {
+    state.isBackgroundSpectrumDragging = false;
+    elements.backgroundSpectrumArea.releasePointerCapture?.(event.pointerId);
+  });
+  elements.backgroundSpectrumArea.addEventListener('pointercancel', () => {
+    state.isBackgroundSpectrumDragging = false;
+  });
+  elements.backgroundSpectrumArea.addEventListener('lostpointercapture', () => {
+    state.isBackgroundSpectrumDragging = false;
+  });
+  elements.backgroundImportBtn.addEventListener('click', () => {
+    handleBackgroundImportFile().catch((error) => {
+      console.error(error);
+      setStatus('背景导入失败，请查看控制台', 'error');
+    });
+  });
+  elements.backgroundDoneBtn.addEventListener('click', () => {
+    handleBackgroundSave().catch((error) => {
+      console.error(error);
+      setStatus('背景保存失败，请查看控制台', 'error');
+    });
+  });
+  elements.backgroundResetBtn.addEventListener('click', handleBackgroundReset);
 
   elements.minimizeBtn.addEventListener('click', () => window.desktopApi.window.minimize());
   elements.maximizeBtn.addEventListener('click', async () => {
@@ -497,11 +1002,47 @@ async function initialize() {
     elements.maximizeBtn.textContent = value ? '❐' : '□';
   });
 
+  document.addEventListener('pointerdown', (event) => {
+    if (
+      state.isModuleMenuOpen &&
+      !elements.moduleSwitcherBtn.contains(event.target) &&
+      !elements.moduleSwitcherMenu.contains(event.target)
+    ) {
+      closeModuleMenu();
+    }
+
+    if (state.isBackgroundPaletteOpen) {
+      if (
+        elements.backgroundTool.contains(event.target) ||
+        elements.modalRoot.contains(event.target)
+      ) {
+        return;
+      }
+
+      closeBackgroundPalette();
+    }
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      if (state.isModuleMenuOpen) {
+        closeModuleMenu();
+      }
+
+      if (state.isBackgroundPaletteOpen) {
+        closeBackgroundPalette();
+      }
+    }
+  });
+
   if (info.previewModal === 'account-mapping') {
     setTimeout(() => {
       handleOpenAccountMappings().catch((error) => {
         console.error(error);
       });
+    }, 120);
+  } else if (info.previewModal === 'background-palette') {
+    setTimeout(() => {
+      openBackgroundPalette();
     }, 120);
   }
 }

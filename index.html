@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="./src/styles.css" />
   </head>
   <body>
-    <div class="app-shell">
+    <div id="appShell" class="app-shell">
       <header class="window-bar">
         <div class="drag-region"></div>
         <div class="window-actions no-drag">
@@ -26,40 +26,98 @@
       <main class="page-body">
         <h1 class="page-title">网银账单小助手</h1>
 
-        <section class="control-board">
-          <div class="control-row">
-            <div class="cell left">
-              <button id="importFileBtn" class="primary-btn" type="button">导入文件</button>
-            </div>
-            <div class="cell center">
-              <label class="select-label" for="templateSelect">模版</label>
-              <select id="templateSelect" class="template-select"></select>
-            </div>
-            <div class="cell right">
-              <button id="exportFileBtn" class="primary-btn" type="button" disabled>导出文件</button>
+        <section class="workspace-shell">
+          <div class="module-switcher">
+            <button id="moduleSwitcherBtn" class="module-switcher-trigger" type="button" aria-haspopup="true" aria-expanded="false">
+              <span class="module-switcher-icon" aria-hidden="true">🔁</span>
+              <span id="currentModuleName" class="module-switcher-name">网银账单生成</span>
+            </button>
+            <div id="moduleSwitcherMenu" class="module-switcher-menu" hidden>
+              <button class="module-option is-active" type="button" data-module="statement-generator">网银账单生成</button>
+              <button class="module-option" type="button" data-module="new-account-generator">新开账户生成网银账单</button>
             </div>
           </div>
 
-          <div class="control-row">
-            <div class="cell left">
-              <button id="importTemplateBtn" class="secondary-btn" type="button">导入模版</button>
-            </div>
-            <div class="cell center">
-              <div class="button-stack">
-                <button id="manageTemplateBtn" class="secondary-btn" type="button">管理模版</button>
-                <button id="accountMappingBtn" class="secondary-btn" type="button">账户映射</button>
+          <section id="statementModulePanel" class="control-board module-panel">
+            <div class="control-row">
+              <div class="cell left">
+                <button id="importFileBtn" class="primary-btn" type="button">导入文件</button>
+              </div>
+              <div class="cell center">
+                <label class="select-label" for="templateSelect">模版</label>
+                <select id="templateSelect" class="template-select"></select>
+              </div>
+              <div class="cell right">
+                <div class="export-actions">
+                  <button id="exportDetailBtn" class="primary-btn" type="button" disabled>导出明细</button>
+                  <button id="exportBalanceBtn" class="secondary-btn export-balance-btn" type="button" disabled>导出余额</button>
+                </div>
               </div>
             </div>
-            <div class="cell right">
-              <div id="statusBox" class="status-box">等待操作</div>
+
+            <div class="control-row">
+              <div class="cell left">
+                <button id="importTemplateBtn" class="secondary-btn" type="button">导入模版</button>
+              </div>
+              <div class="cell center">
+                <div class="button-stack">
+                  <button id="manageTemplateBtn" class="secondary-btn" type="button">管理模版</button>
+                  <button id="accountMappingBtn" class="secondary-btn" type="button">账户映射</button>
+                </div>
+              </div>
+              <div class="cell right">
+                <div id="statusBox" class="status-box">等待操作</div>
+              </div>
             </div>
-          </div>
+          </section>
+
+          <section id="newAccountModulePanel" class="control-board module-placeholder" hidden>
+            <div class="module-placeholder-title">新开账户生成网银账单</div>
+            <div class="module-placeholder-copy">该模块入口已预留，本次版本先完成网银明细账单生成与余额账单导出能力。</div>
+          </section>
         </section>
       </main>
 
       <footer class="page-footer">
         <div class="version-text"><span class="version-label">Version</span> <span id="appVersion">-</span></div>
       </footer>
+
+      <div id="backgroundTool" class="background-tool">
+        <button
+          id="backgroundPaletteBtn"
+          class="palette-trigger"
+          type="button"
+          aria-label="背景调色盘"
+          title="背景调色盘"
+        >
+          <span class="palette-trigger-emoji" aria-hidden="true">🎨</span>
+        </button>
+
+        <section id="backgroundPalettePanel" class="palette-panel" hidden aria-label="背景设置">
+          <div class="palette-panel-body">
+            <div id="backgroundSpectrumArea" class="palette-spectrum-shell" aria-label="全色谱选色板">
+              <canvas
+                id="backgroundSpectrumCanvas"
+                class="palette-spectrum-canvas"
+                width="320"
+                height="320"
+                aria-hidden="true"
+              ></canvas>
+              <div id="backgroundSpectrumCrosshair" class="palette-spectrum-crosshair" hidden></div>
+            </div>
+            <div class="palette-selected-color-box">
+              <div id="backgroundSelectedColorSwatch" class="palette-selected-color-swatch" aria-hidden="true"></div>
+            </div>
+          </div>
+          <div class="palette-panel-actions">
+            <button id="backgroundResetBtn" class="palette-action danger-text" type="button">重置</button>
+            <div class="palette-panel-actions-right">
+              <button id="backgroundImportBtn" class="palette-action" type="button">导入背景文件</button>
+              <button id="backgroundDoneBtn" class="palette-action solid" type="button">完成</button>
+            </div>
+          </div>
+        </section>
+      </div>
     </div>
 
     <div id="modalRoot"></div>

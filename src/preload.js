@@ -4,8 +4,10 @@ contextBridge.exposeInMainWorld('desktopApi', {
   app: {
     getInfo: () => ipcRenderer.invoke('app:get-info')
   },
-  enums: {
-    importEnum: () => ipcRenderer.invoke('enum:import')
+  background: {
+    selectFile: () => ipcRenderer.invoke('background:select-file'),
+    save: (payload) => ipcRenderer.invoke('background:save', payload),
+    reset: () => ipcRenderer.invoke('background:reset')
   },
   accountMappings: {
     list: () => ipcRenderer.invoke('account-mapping:list'),
@@ -28,6 +30,7 @@ contextBridge.exposeInMainWorld('desktopApi', {
   },
   files: {
     importFile: (templateId) => ipcRenderer.invoke('file:import', templateId),
-    exportFile: () => ipcRenderer.invoke('file:export')
+    exportDetail: () => ipcRenderer.invoke('file:export-detail'),
+    exportBalance: () => ipcRenderer.invoke('file:export-balance')
   }
 });
