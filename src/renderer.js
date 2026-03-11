@@ -943,7 +943,7 @@ function renderTemplateTableRows(tableBody) {
     row.innerHTML = `
       <td>${template.name}</td>
       <td class="action-cell">
-        <button class="text-action" type="button" data-action="manage">模板管理</button>
+        <button class="text-action" type="button" data-action="manage">修改</button>
         <button class="text-action danger" type="button" data-action="delete">删除</button>
       </td>
     `;
@@ -1336,6 +1336,21 @@ function applyNewAccountPreviewState() {
   });
 }
 
+function applyTemplateManagerPreviewState() {
+  setCurrentModule(MODULES.statementGenerator.id);
+  state.templates = [
+    {
+      id: 'preview-template-1',
+      name: 'LusoBank-MO'
+    },
+    {
+      id: 'preview-template-2',
+      name: 'BankABC-HK'
+    }
+  ];
+  openModal(createTemplateManagerDialog());
+}
+
 async function handleNewAccountGenerate() {
   const result = await window.desktopApi.newAccount.generate(getNewAccountPayload());
 
@@ -1586,6 +1601,10 @@ async function initialize() {
       handleOpenAccountMappings().catch((error) => {
         console.error(error);
       });
+    }, 120);
+  } else if (info.previewModal === 'template-manager') {
+    setTimeout(() => {
+      applyTemplateManagerPreviewState();
     }, 120);
   } else if (info.previewModal === 'new-account') {
     setTimeout(() => {
