@@ -30,6 +30,9 @@ const {
   ensureActivityLogFile,
   writeErrorReport
 } = require('./backend/logger');
+const {
+  reportStartupFailure
+} = require('./backend/startup-failure');
 
 if (process.env.APP_USER_DATA_DIR) {
   app.setPath('userData', process.env.APP_USER_DATA_DIR);
@@ -134,6 +137,26 @@ function initializeActivityLog() {
     details: [`版本：${app.getVersion()}`]
   });
   return activityLogFilePath;
+}
+
+function handleStartupFailure(error) {
+  let logPath = getActivityLogFallbackFilePath();
+
+  try {
+    logPath = initializeActivityLog();
+  } catch (logError) {
+    console.error(logError);
+  }
+
+  console.error(error);
+
+  reportStartupFailure({
+    error,
+    logFilePath: logPath,
+    appendRecord: (filePath, payload) => appendActivityRecord(filePath, payload),
+    showErrorBox: (title, message) => dialog.showErrorBox(title, message),
+    exit: (exitCode) => app.exit(exitCode)
+  });
 }
 
 function appendActivityLogEntry({ level = 'info', message, details = [] }) {
@@ -3217,23 +3240,28 @@ function registerNewAccountHandlers() {
   });
 }
 
-app.whenReady().then(() => {
-  const dataPath = path.join(app.getPath('userData'), 'tool-data.sqlite');
-  database = new AppDatabase(dataPath);
-  database.init();
-  syncTemplateLibraryFile();
-  initializeActivityLog();
+app.whenReady()
+  .then(() => {
+    initializeActivityLog();
 
-  registerWindowHandlers();
-  registerAppHandlers();
-  registerErrorHandlers();
-  registerBackgroundHandlers();
-  registerAccountMappingHandlers();
-  registerTemplateHandlers();
-  registerFileHandlers();
-  registerNewAccountHandlers();
-  createWindow();
-});
+    const dataPath = path.join(app.getPath('userData'), 'tool-data.sqlite');
+    database = new AppDatabase(dataPath);
+    database.init();
+    syncTemplateLibraryFile();
+
+    registerWindowHandlers();
+    registerAppHandlers();
+    registerErrorHandlers();
+    registerBackgroundHandlers();
+    registerAccountMappingHandlers();
+    registerTemplateHandlers();
+    registerFileHandlers();
+    registerNewAccountHandlers();
+    createWindow();
+  })
+  .catch((error) => {
+    handleStartupFailure(error);
+  });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

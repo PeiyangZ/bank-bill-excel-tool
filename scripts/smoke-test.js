@@ -2,6 +2,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
 const XLSX = require('xlsx');
 const { AppDatabase } = require('../src/backend/database');
 const {
@@ -22,6 +23,10 @@ const {
   writeErrorReport
 } = require('../src/backend/logger');
 const {
+  buildStartupFailureDialogMessage,
+  reportStartupFailure
+} = require('../src/backend/startup-failure');
+const {
   BALANCE_SEED_GENERATION_METHODS,
   findPreviousBalanceSeed,
   readBalanceSeedRecords,
@@ -33,6 +38,59 @@ function makeWorkbook(filePath, rows) {
   const worksheet = XLSX.utils.aoa_to_sheet(rows);
   XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
   XLSX.writeFile(workbook, filePath);
+}
+
+function makeLegacyDatabase(filePath) {
+  const db = new DatabaseSync(filePath);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      source_file_name TEXT NOT NULL,
+      headers_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS template_mappings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      template_id INTEGER NOT NULL,
+      template_field TEXT NOT NULL,
+      mapped_field TEXT NOT NULL,
+      row_index INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE,
+      UNIQUE(template_id, row_index)
+    );
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      setting_key TEXT PRIMARY KEY,
+      setting_value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS account_mappings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bank_account_id TEXT NOT NULL UNIQUE,
+      clearing_account_id TEXT NOT NULL,
+      row_index INTEGER NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  db
+    .prepare(`
+      INSERT INTO templates (name, source_file_name, headers_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    .run(
+      'legacy-template',
+      'legacy.xlsx',
+      JSON.stringify(['字段A', '字段B']),
+      '2026-03-12T00:00:00.000Z',
+      '2026-03-12T00:00:00.000Z'
+    );
+  db.close();
 }
 
 function run() {
@@ -57,7 +115,9 @@ function run() {
   const balanceOutputPath = path.join(root, '2026-03-09', 'balance', 'template-Balance-2026-03-09.xlsx');
   const errorReportRoot = path.join(root, 'reports');
   const activityLogPath = path.join(root, 'app_activity_log.txt');
+  const startupFailureLogPath = path.join(root, 'startup-failure.log');
   const storageRoot = path.join(root, 'storage');
+  const legacyDbPath = path.join(root, 'legacy.sqlite');
 
   makeWorkbook(templatePath, [
     ['原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H'],
@@ -102,9 +162,24 @@ function run() {
     ['银行名称', '所在地', '币种', '银行账号', '账单日期', '期初余额', '期初可用余额', '期末余额', '期末可用余额', '扩展字段'],
     ['旧银行', '旧地点', '旧币种', '旧账号', '旧日期', '旧期初', '旧可用', '旧期末', '旧期末可用', '旧扩展']
   ]);
+  makeLegacyDatabase(legacyDbPath);
 
   const db = new AppDatabase(dbPath);
   db.init();
+  const migratedDb = new AppDatabase(legacyDbPath);
+  migratedDb.init();
+  migratedDb.db.close();
+
+  const migratedRawDb = new DatabaseSync(legacyDbPath);
+  const templateColumns = migratedRawDb.prepare('PRAGMA table_info(templates)').all();
+  assert(templateColumns.some((column) => column.name === 'template_key'));
+  const migratedTemplate = migratedRawDb
+    .prepare('SELECT template_key AS templateKey FROM templates WHERE name = ?')
+    .get('legacy-template');
+  assert(migratedTemplate.templateKey);
+  const templateIndexes = migratedRawDb.prepare("PRAGMA index_list('templates')").all();
+  assert(templateIndexes.some((index) => index.name === 'templates_template_key_unique'));
+  migratedRawDb.close();
 
   const headers = extractHeaders(templatePath);
   assert.deepStrictEqual(headers, ['原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H']);
@@ -517,6 +592,27 @@ function run() {
   });
   const activityLogContent = fs.readFileSync(activityLogPath, 'utf8');
   assert(activityLogContent.includes('[INFO] 执行导出 | 模板名：template'));
+
+  const startupError = new Error('旧数据库迁移失败');
+  const dialogCalls = [];
+  const exitCalls = [];
+  const startupDialogMessage = buildStartupFailureDialogMessage(startupError, startupFailureLogPath);
+  assert(startupDialogMessage.includes('错误摘要：旧数据库迁移失败'));
+  assert(startupDialogMessage.includes(`日志文件：${startupFailureLogPath}`));
+  reportStartupFailure({
+    error: startupError,
+    logFilePath: startupFailureLogPath,
+    appendRecord: (filePath, payload) => appendActivityRecord(filePath, payload),
+    showErrorBox: (title, message) => dialogCalls.push({ title, message }),
+    exit: (exitCode) => exitCalls.push(exitCode)
+  });
+  assert.strictEqual(dialogCalls.length, 1);
+  assert.strictEqual(dialogCalls[0].title, '网银账单小助手启动失败');
+  assert(dialogCalls[0].message.includes('错误摘要：旧数据库迁移失败'));
+  assert.strictEqual(exitCalls.length, 1);
+  assert.strictEqual(exitCalls[0], 1);
+  const startupFailureLogContent = fs.readFileSync(startupFailureLogPath, 'utf8');
+  assert(startupFailureLogContent.includes('[ERROR] 应用启动失败 | 错误摘要：旧数据库迁移失败'));
 
   console.log('smoke test passed');
 }

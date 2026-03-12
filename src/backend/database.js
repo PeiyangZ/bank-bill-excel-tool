@@ -114,44 +114,52 @@ class AppDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-
-      CREATE UNIQUE INDEX IF NOT EXISTS templates_template_key_unique
-      ON templates(template_key);
     `);
 
-    this.ensureTemplateKeyColumn();
+    this.ensureTemplateKeySupport();
   }
 
-  ensureTemplateKeyColumn() {
-    const columns = this.db.prepare('PRAGMA table_info(templates)').all();
-    const hasTemplateKey = columns.some((column) => normalizeText(column.name) === 'template_key');
+  hasColumn(tableName, columnName) {
+    const columns = this.db.prepare(`PRAGMA table_info(${tableName})`).all();
+    return columns.some((column) => normalizeText(column.name) === normalizeText(columnName));
+  }
 
-    if (!hasTemplateKey) {
-      this.db.exec('ALTER TABLE templates ADD COLUMN template_key TEXT;');
+  ensureTemplateKeySupport() {
+    this.db.exec('BEGIN');
+
+    try {
+      if (!this.hasColumn('templates', 'template_key')) {
+        this.db.exec('ALTER TABLE templates ADD COLUMN template_key TEXT;');
+      }
+
+      const rows = this.db
+        .prepare(`
+          SELECT id
+          FROM templates
+          WHERE COALESCE(template_key, '') = ''
+        `)
+        .all();
+
+      const updateStatement = this.db.prepare(`
+        UPDATE templates
+        SET template_key = ?
+        WHERE id = ?
+      `);
+
+      rows.forEach((row) => {
+        updateStatement.run(randomUUID(), row.id);
+      });
+
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS templates_template_key_unique
+        ON templates(template_key);
+      `);
+
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
     }
-
-    const rows = this.db
-      .prepare(`
-        SELECT id
-        FROM templates
-        WHERE COALESCE(template_key, '') = ''
-      `)
-      .all();
-
-    const updateStatement = this.db.prepare(`
-      UPDATE templates
-      SET template_key = ?
-      WHERE id = ?
-    `);
-
-    rows.forEach((row) => {
-      updateStatement.run(randomUUID(), row.id);
-    });
-
-    this.db.exec(`
-      CREATE UNIQUE INDEX IF NOT EXISTS templates_template_key_unique
-      ON templates(template_key);
-    `);
   }
 
   buildTemplateSummaryFromRow(row) {
