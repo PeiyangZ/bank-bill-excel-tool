@@ -54,6 +54,7 @@ let lastErrorReport = null;
 let activityLogFilePath = '';
 let lastFileImportContext = null;
 let lastManualBalancePrompt = null;
+let lastPendingBigAccountSelection = null;
 
 const DEFAULT_BACKGROUND_COLOR = '#efe8da';
 const BUNDLED_ENUM_FILE_NAME = 'COMMON枚举.xlsx';
@@ -62,10 +63,16 @@ const MISSING_ENUM_MESSAGE = '内置网银账单枚举表缺失，请检查安�
 const BALANCE_DISABLED_OPTION = '无';
 const BALANCE_CALCULATED_OPTION = '通过发生额计算';
 const MERCHANT_ID_SELF_INPUT_OPTION = '自己输入';
+const MERCHANT_ID_MULTI_ACCOUNT_MARKER = '__MULTI_BIG_ACCOUNT__';
 const CUSTOM_INPUT_TARGET_FIELDS = new Set(['MerchantId', 'Currency']);
+const SIGNED_AMOUNT_MAPPING_FIELD = '按正负号拆分的发生额';
 const AMOUNT_BASED_NAME_MAPPING_FIELD = '根据发生额做映射的户名';
 const AMOUNT_BASED_ACCOUNT_MAPPING_FIELD = '根据发生额做映射的账户号';
-const ADVANCED_MAPPING_FIELDS = [AMOUNT_BASED_NAME_MAPPING_FIELD, AMOUNT_BASED_ACCOUNT_MAPPING_FIELD];
+const ADVANCED_MAPPING_FIELDS = [
+  SIGNED_AMOUNT_MAPPING_FIELD,
+  AMOUNT_BASED_NAME_MAPPING_FIELD,
+  AMOUNT_BASED_ACCOUNT_MAPPING_FIELD
+];
 const NEW_ACCOUNT_EXPORT_NAME = 'NEW_BALANCE';
 const BACKGROUND_IMAGE_LIMITS = Object.freeze({
   maxSizeBytes: 5 * 1024 * 1024,
@@ -168,6 +175,10 @@ function clearPendingManualBalancePrompt() {
   lastManualBalancePrompt = null;
 }
 
+function clearPendingBigAccountSelection() {
+  lastPendingBigAccountSelection = null;
+}
+
 function rememberLastFileImportContext(context = null) {
   lastFileImportContext = context
     ? {
@@ -175,7 +186,31 @@ function rememberLastFileImportContext(context = null) {
         template: context.template,
         mappings: Array.isArray(context.mappings) ? context.mappings.map((mapping) => ({ ...mapping })) : [],
         orderedTargetFields: Array.isArray(context.orderedTargetFields) ? context.orderedTargetFields.slice() : [],
-        inputFilePath: context.inputFilePath
+        inputFilePath: context.inputFilePath,
+        selectedBigAccount: context.selectedBigAccount
+          ? {
+              merchantId: normalizeCell(context.selectedBigAccount.merchantId),
+              currency: normalizeCell(context.selectedBigAccount.currency)
+            }
+          : null
+      }
+    : null;
+}
+
+function rememberPendingBigAccountSelection(context = null) {
+  lastPendingBigAccountSelection = context
+    ? {
+        templateId: context.templateId,
+        template: context.template,
+        mappings: Array.isArray(context.mappings) ? context.mappings.map((mapping) => ({ ...mapping })) : [],
+        orderedTargetFields: Array.isArray(context.orderedTargetFields) ? context.orderedTargetFields.slice() : [],
+        inputFilePath: context.inputFilePath,
+        options: Array.isArray(context.options)
+          ? context.options.map((option) => ({
+              merchantId: normalizeCell(option.merchantId),
+              currency: normalizeCell(option.currency)
+            }))
+          : []
       }
     : null;
 }
@@ -202,6 +237,19 @@ function buildManualBalanceRequiredResult(prompt, generatedFiles) {
     errorReportReady: false,
     manualBalancePromptReady: true,
     manualBalancePrompt: prompt ? { ...prompt } : null
+  };
+}
+
+function buildBigAccountSelectionRequiredResult(options = []) {
+  clearLastErrorReport();
+  return {
+    status: 'select-big-account',
+    message: '请选择本次使用的大账号 / 币种',
+    options: options.map((option) => ({
+      merchantId: normalizeCell(option.merchantId),
+      currency: normalizeCell(option.currency),
+      label: `${normalizeCell(option.merchantId)} / ${normalizeCell(option.currency)}`
+    }))
   };
 }
 
@@ -362,6 +410,82 @@ function getAvailableCurrencyCodes() {
     console.error(error);
     return [];
   }
+}
+
+function getTemplatesStorageDir() {
+  return path.join(ensureStorageRoot(), 'templates');
+}
+
+function getTemplateLibraryFilePath() {
+  return path.join(getTemplatesStorageDir(), 'template-library.json');
+}
+
+function expandBigAccountConfigurations(bigAccounts = []) {
+  const expandedRows = [];
+
+  bigAccounts.forEach((item) => {
+    const merchantId = normalizeCell(item.merchantId);
+    const currencies = Array.from(
+      new Set(
+        (Array.isArray(item.currencies) ? item.currencies : [])
+          .map((value) => normalizeCell(value))
+          .filter((value) => value !== '')
+      )
+    );
+
+    currencies.forEach((currency) => {
+      expandedRows.push({
+        merchantId,
+        currency
+      });
+    });
+  });
+
+  return expandedRows;
+}
+
+function buildTemplateLibraryPayload() {
+  return {
+    bundleVersion: 1,
+    exportedAt: new Date().toISOString(),
+    templates: database.listTemplateBundleEntries()
+  };
+}
+
+function writeTemplateBundleFile(filePath) {
+  const payload = buildTemplateLibraryPayload();
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  return payload;
+}
+
+function syncTemplateLibraryFile() {
+  return writeTemplateBundleFile(getTemplateLibraryFilePath());
+}
+
+function readTemplateBundleFile(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new FileValidationError('FILE_READ', '模板文件不存在或不可读');
+  }
+
+  let parsed = null;
+
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (_error) {
+    throw new FileValidationError('FILE_READ', '模板文件格式错误，请重新确认');
+  }
+
+  const templates = Array.isArray(parsed?.templates) ? parsed.templates : [];
+
+  return templates.map((item) => ({
+    templateKey: normalizeCell(item.templateKey),
+    name: normalizeCell(item.name),
+    sourceFileName: normalizeCell(item.sourceFileName) || `${normalizeCell(item.name) || 'template'}.xlsx`,
+    headers: Array.isArray(item.headers) ? item.headers.map((value) => normalizeCell(value)).filter((value) => value !== '') : [],
+    mappings: Array.isArray(item.mappings) ? item.mappings : [],
+    bigAccounts: Array.isArray(item.bigAccounts) ? item.bigAccounts : []
+  }));
 }
 
 function normalizeBackgroundColor(colorHex) {
@@ -649,14 +773,18 @@ function decodeCustomInputMappingValue(rawValue) {
     return {
       isCustomInput: false,
       mappedField: normalizedValue,
-      customValue: ''
+      customValue: '',
+      isMultiBigAccount: false
     };
   }
+
+  const customValue = normalizedValue.slice(FIXED_FIELD_VALUE_PREFIX.length);
 
   return {
     isCustomInput: true,
     mappedField: MERCHANT_ID_SELF_INPUT_OPTION,
-    customValue: normalizedValue.slice(FIXED_FIELD_VALUE_PREFIX.length)
+    customValue: customValue === MERCHANT_ID_MULTI_ACCOUNT_MARKER ? '' : customValue,
+    isMultiBigAccount: customValue === MERCHANT_ID_MULTI_ACCOUNT_MARKER
   };
 }
 
@@ -704,7 +832,8 @@ function normalizeMappingRows({ template, mappings, enumValues }) {
           : savedValue === BALANCE_DISABLED_OPTION
             ? ''
             : savedValue || '',
-      customValue: customInputMapping ? customInputMapping.customValue : ''
+      customValue: customInputMapping ? customInputMapping.customValue : '',
+      isMultiBigAccount: customInputMapping ? customInputMapping.isMultiBigAccount : false
     };
   });
 }
@@ -764,7 +893,8 @@ function getTemplateMappingConfig(templateId) {
     advancedMappingFields: ADVANCED_MAPPING_FIELDS.slice(),
     exportTargetFields: buildExportTargetFields(enumValues),
     mappings,
-    exportMappings
+    exportMappings,
+    bigAccounts: Array.isArray(templatePayload.bigAccounts) ? templatePayload.bigAccounts : []
   };
 }
 
@@ -794,11 +924,13 @@ function buildOutputFilePath({ kind, outputFileName }) {
   };
 }
 
-function buildStatementOutputFilePath({ kind, templateName, outputTag, dateRangeLabel }) {
+function buildStatementOutputFilePath({ kind, templateName, merchantId = '', outputTag, dateRangeLabel }) {
   const safeDateLabel = dateRangeLabel || getToday();
   return buildOutputFilePath({
     kind,
-    outputFileName: `${templateName}-${outputTag}-${safeDateLabel}.xlsx`
+    outputFileName: merchantId
+      ? `${templateName}-${merchantId}-${outputTag}-${safeDateLabel}.xlsx`
+      : `${templateName}-${outputTag}-${safeDateLabel}.xlsx`
   });
 }
 
@@ -1298,11 +1430,15 @@ function createWindow() {
 function buildTemplateSummary(template) {
   return {
     id: template.id,
+    templateKey: template.templateKey,
     name: template.name,
     sourceFileName: template.sourceFileName,
     headers: template.headers,
     createdAt: template.createdAt,
-    updatedAt: template.updatedAt
+    updatedAt: template.updatedAt,
+    bigAccountCount: template.bigAccountCount || 0,
+    bigAccountMode: template.bigAccountMode || 'unset',
+    bigAccountSummary: template.bigAccountSummary || '未设置'
   };
 }
 
@@ -1586,7 +1722,7 @@ function registerAccountMappingHandlers() {
   });
 }
 
-function validateTemplateMappings({ template, mappings, enumValues }) {
+function validateTemplateConfiguration({ template, mappings, enumValues, bigAccounts = [] }) {
   const targetFields = buildManagedMappingFields(enumValues);
   const targetFieldSet = new Set(targetFields);
   const sourceFieldSet = new Set(template.headers.map((header) => normalizeCell(header)));
@@ -1607,11 +1743,44 @@ function validateTemplateMappings({ template, mappings, enumValues }) {
   });
 
   const cleanedMappings = [];
+  const merchantIdMapping = mappingByTarget.get('MerchantId') || {
+    mappedField: '',
+    customValue: '',
+    isMultiBigAccount: false
+  };
+  const signedAmountSourceField = normalizeCell(mappingByTarget.get(SIGNED_AMOUNT_MAPPING_FIELD)?.mappedField);
+  const creditAmountSourceField = normalizeCell(mappingByTarget.get('Credit Amount')?.mappedField);
+  const debitAmountSourceField = normalizeCell(mappingByTarget.get('Debit Amount')?.mappedField);
+  const usesSignedAmountMapping = signedAmountSourceField !== '';
+  const usesDirectAmountMapping = creditAmountSourceField !== '' || debitAmountSourceField !== '';
+
+  if (usesSignedAmountMapping && usesDirectAmountMapping) {
+    throw new FileValidationError('FILE_READ', '“按正负号拆分的发生额”与 Credit Amount / Debit Amount 不能同时设置');
+  }
+
+  if (usesSignedAmountMapping && !sourceFieldSet.has(signedAmountSourceField)) {
+    throw new FileValidationError('FILE_READ', `映射字段不存在：${signedAmountSourceField}`);
+  }
+
+  const cleanedBigAccounts = merchantIdMapping.isMultiBigAccount
+    ? bigAccounts.map((item) => ({
+        merchantId: normalizeCell(item.merchantId),
+        currencies: Array.from(
+          new Set(
+            (Array.isArray(item.currencies) ? item.currencies : [])
+              .map((value) => normalizeCell(value))
+              .filter((value) => value !== '')
+          )
+        ),
+        isMultiCurrency: Boolean(item.isMultiCurrency)
+      }))
+    : [];
 
   targetFields.forEach((targetField) => {
     const selectedMapping = mappingByTarget.get(targetField) || {
       mappedField: '',
-      customValue: ''
+      customValue: '',
+      isMultiBigAccount: false
     };
     const selectedSourceField = selectedMapping.mappedField;
     const normalizedSourceField = targetField === 'Balance'
@@ -1645,6 +1814,14 @@ function validateTemplateMappings({ template, mappings, enumValues }) {
     }
 
     if (CUSTOM_INPUT_TARGET_FIELDS.has(targetField) && normalizedSourceField === MERCHANT_ID_SELF_INPUT_OPTION) {
+      if (targetField === 'MerchantId' && selectedMapping.isMultiBigAccount) {
+        cleanedMappings.push({
+          templateField: targetField,
+          mappedField: `${FIXED_FIELD_VALUE_PREFIX}${MERCHANT_ID_MULTI_ACCOUNT_MARKER}`
+        });
+        return;
+      }
+
       const customValue = selectedMapping.customValue;
 
       if (!customValue) {
@@ -1668,7 +1845,38 @@ function validateTemplateMappings({ template, mappings, enumValues }) {
     });
   });
 
-  return cleanedMappings;
+  if (merchantIdMapping.isMultiBigAccount) {
+    if (!cleanedBigAccounts.length) {
+      throw new FileValidationError('FILE_READ', '请至少维护 1 条大账号配置');
+    }
+
+    const duplicateKeys = new Set();
+
+    cleanedBigAccounts.forEach((item) => {
+      if (!item.merchantId) {
+        throw new FileValidationError('FILE_READ', '大账号不能为空');
+      }
+
+      if (!item.currencies.length) {
+        throw new FileValidationError('FILE_READ', '每条大账号配置都必须至少选择 1 个币种');
+      }
+
+      item.currencies.forEach((currency) => {
+        const compositeKey = `${item.merchantId}@@${currency}`;
+
+        if (duplicateKeys.has(compositeKey)) {
+          throw new FileValidationError('FILE_READ', `大账号 ${item.merchantId} 的币种 ${currency} 重复`);
+        }
+
+        duplicateKeys.add(compositeKey);
+      });
+    });
+  }
+
+  return {
+    mappings: cleanedMappings,
+    bigAccounts: expandBigAccountConfigurations(cleanedBigAccounts)
+  };
 }
 
 function registerTemplateHandlers() {
@@ -1696,6 +1904,7 @@ function registerTemplateHandlers() {
         sourceFileName: path.basename(selectedPath),
         headers
       });
+      syncTemplateLibraryFile();
       clearLastErrorReport();
       appendActivityLogEntry({
         level: 'info',
@@ -1733,6 +1942,7 @@ function registerTemplateHandlers() {
   ipcMain.handle('template:delete', (_event, templateId) => {
     const template = database.getTemplate(templateId);
     database.deleteTemplate(templateId);
+    syncTemplateLibraryFile();
     appendActivityLogEntry({
       level: 'info',
       message: '删除模板成功',
@@ -1768,7 +1978,8 @@ function registerTemplateHandlers() {
         targetFields: mappingConfig.targetFields,
         advancedMappingFields: mappingConfig.advancedMappingFields,
         exportTargetFields: mappingConfig.exportTargetFields,
-        mappings: mappingConfig.mappings
+        mappings: mappingConfig.mappings,
+        bigAccounts: mappingConfig.bigAccounts
       };
     } catch (error) {
       if (error instanceof FileValidationError) {
@@ -1815,13 +2026,15 @@ function registerTemplateHandlers() {
         });
       }
 
-      const mappings = validateTemplateMappings({
+      const templateConfiguration = validateTemplateConfiguration({
         template,
         mappings: payload.mappings,
-        enumValues: loadEnumValues(enumConfig.filePath)
+        enumValues: loadEnumValues(enumConfig.filePath),
+        bigAccounts: payload.bigAccounts
       });
 
-      database.saveMappings(payload.templateId, mappings);
+      database.saveMappings(payload.templateId, templateConfiguration.mappings, templateConfiguration.bigAccounts);
+      syncTemplateLibraryFile();
       clearLastErrorReport();
       appendActivityLogEntry({
         level: 'info',
@@ -1861,6 +2074,234 @@ function registerTemplateHandlers() {
       });
     }
   });
+
+  ipcMain.handle('template:rename', (_event, payload = {}) => {
+    const templateId = Number(payload.templateId);
+    const nextName = normalizeCell(payload.name);
+    const template = database.getTemplate(templateId);
+
+    try {
+      if (!template) {
+        return createErrorResult({
+          step: '重命名模板',
+          message: '未找到对应模板',
+          errorCode: 'TEMPLATE_NOT_FOUND',
+          context: { templateId }
+        });
+      }
+
+      if (!nextName) {
+        return createErrorResult({
+          step: '重命名模板',
+          message: '请输入新的模板名称',
+          errorCode: 'TEMPLATE_NAME_REQUIRED',
+          templateName: template.name
+        });
+      }
+
+      const existingTemplate = database.getTemplateByName(nextName);
+
+      if (existingTemplate && existingTemplate.id !== templateId) {
+        return createErrorResult({
+          step: '重命名模板',
+          message: '模板名称已存在，请重新输入',
+          errorCode: 'TEMPLATE_NAME_DUPLICATED',
+          templateName: template.name
+        });
+      }
+
+      const renamedTemplate = database.renameTemplate(templateId, nextName);
+      syncTemplateLibraryFile();
+      clearLastErrorReport();
+      appendActivityLogEntry({
+        level: 'info',
+        message: '重命名模板成功',
+        details: [`原模板名：${template.name}`, `新模板名：${nextName}`]
+      });
+      return {
+        status: 'success',
+        message: '模板名称修改成功',
+        template: buildTemplateSummary(renamedTemplate)
+      };
+    } catch (error) {
+      return createErrorResult({
+        step: '重命名模板',
+        message: '模板名称修改失败，请导出报错文件查看详情',
+        errorCode: 'TEMPLATE_RENAME_RUNTIME',
+        errorType: '系统错误',
+        originalError: error,
+        context: {
+          templateId,
+          templateName: template?.name || ''
+        },
+        templateName: template?.name || ''
+      });
+    }
+  });
+
+  ipcMain.handle('template:export-bundle', async () => {
+    try {
+      const saveResult = await dialog.showSaveDialog(mainWindow, {
+        defaultPath: 'template-library.json',
+        filters: [
+          {
+            name: 'JSON',
+            extensions: ['json']
+          }
+        ]
+      });
+
+      if (saveResult.canceled || !saveResult.filePath) {
+        return { status: 'cancelled' };
+      }
+
+      writeTemplateBundleFile(saveResult.filePath);
+      clearLastErrorReport();
+      appendActivityLogEntry({
+        level: 'info',
+        message: '导出模板文件成功',
+        details: [`导出路径：${saveResult.filePath}`]
+      });
+      return {
+        status: 'success',
+        message: '模板文件导出成功',
+        filePath: saveResult.filePath
+      };
+    } catch (error) {
+      return createErrorResult({
+        step: '导出模板文件',
+        message: '模板文件导出失败，请导出报错文件查看详情',
+        errorCode: 'TEMPLATE_BUNDLE_EXPORT_RUNTIME',
+        errorType: '系统错误',
+        originalError: error
+      });
+    }
+  });
+
+  ipcMain.handle('template:import-bundle', async () => {
+    const enumConfig = getEnumConfig();
+
+    if (!enumConfig) {
+      return createErrorResult({
+        step: '导入模板文件',
+        message: MISSING_ENUM_MESSAGE,
+        errorCode: 'ENUM_MISSING'
+      });
+    }
+
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile'],
+      filters: [
+        {
+          name: 'JSON',
+          extensions: ['json']
+        }
+      ]
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return { status: 'cancelled' };
+    }
+
+    const selectedPath = result.filePaths[0];
+
+    try {
+      const enumValues = loadEnumValues(enumConfig.filePath);
+      const importedTemplates = readTemplateBundleFile(selectedPath);
+      let createdCount = 0;
+      let updatedCount = 0;
+      let skippedCount = 0;
+
+      importedTemplates.forEach((entry) => {
+        if (!entry.name || !entry.headers.length) {
+          skippedCount += 1;
+          return;
+        }
+
+        try {
+          const existingTemplate = entry.templateKey
+            ? database.getTemplateByKey(entry.templateKey)
+            : database.getTemplateByName(entry.name);
+          const draftTemplate = existingTemplate || {
+            id: 0,
+            templateKey: entry.templateKey,
+            name: entry.name,
+            sourceFileName: entry.sourceFileName,
+            headers: entry.headers,
+            createdAt: '',
+            updatedAt: ''
+          };
+          const validated = validateTemplateConfiguration({
+            template: draftTemplate,
+            mappings: normalizeMappingRows({
+              template: draftTemplate,
+              mappings: entry.mappings,
+              enumValues
+            }),
+            enumValues,
+            bigAccounts: entry.bigAccounts
+          });
+          const template = database.upsertTemplate({
+            templateKey: entry.templateKey,
+            name: entry.name,
+            sourceFileName: entry.sourceFileName,
+            headers: entry.headers
+          });
+
+          database.saveMappings(template.id, validated.mappings, validated.bigAccounts);
+
+          if (existingTemplate) {
+            updatedCount += 1;
+          } else {
+            createdCount += 1;
+          }
+        } catch (error) {
+          if (error instanceof FileValidationError) {
+            skippedCount += 1;
+            return;
+          }
+
+          throw error;
+        }
+      });
+
+      syncTemplateLibraryFile();
+      clearLastErrorReport();
+      appendActivityLogEntry({
+        level: 'info',
+        message: '导入模板包成功',
+        details: [
+          `源文件：${selectedPath}`,
+          `新增：${createdCount}`,
+          `更新：${updatedCount}`,
+          `跳过：${skippedCount}`
+        ]
+      });
+      return {
+        status: 'success',
+        message: `模板文件导入成功：新增${createdCount}，更新${updatedCount}，跳过${skippedCount}`
+      };
+    } catch (error) {
+      if (error instanceof FileValidationError) {
+        return createErrorResult({
+          step: '导入模板文件',
+          message: error.message,
+          errorCode: error.code,
+          originalError: error,
+          context: { selectedPath }
+        });
+      }
+
+      return createErrorResult({
+        step: '导入模板文件',
+        message: '模板文件导入失败，请导出报错文件查看详情',
+        errorCode: 'TEMPLATE_BUNDLE_IMPORT_RUNTIME',
+        errorType: '系统错误',
+        originalError: error,
+        context: { selectedPath }
+      });
+    }
+  });
 }
 
 function buildMappedFieldLookup(mappings) {
@@ -1874,7 +2315,8 @@ function prepareGeneratedFiles({
   template,
   mappings,
   orderedTargetFields,
-  inputFilePath
+  inputFilePath,
+  selectedBigAccount = null
 }) {
   const selectedMappings = mappings.filter((mapping) => {
     if (mapping.templateField === 'Balance') {
@@ -1893,6 +2335,10 @@ function prepareGeneratedFiles({
 
   const mappingByTargetField = buildMappedFieldLookup(selectedMappings);
   const templateNameParts = splitTemplateName(template.name);
+  const selectedMerchantId = normalizeCell(selectedBigAccount?.merchantId);
+  const selectedCurrency = normalizeCell(selectedBigAccount?.currency);
+  const isMultiBigAccountTemplate = normalizeCell(mappingByTargetField.MerchantId)
+    === `${FIXED_FIELD_VALUE_PREFIX}${MERCHANT_ID_MULTI_ACCOUNT_MARKER}`;
 
   if (orderedTargetFields.includes('Channel')) {
     mappingByTargetField.Channel = `${FIXED_FIELD_VALUE_PREFIX}${templateNameParts.bankName}`;
@@ -1900,6 +2346,10 @@ function prepareGeneratedFiles({
 
   if (!mappingByTargetField.BillDate) {
     throw new FileValidationError('FILE_READ', '当前模板必须映射 BillDate 字段');
+  }
+
+  if (isMultiBigAccountTemplate && !selectedMerchantId) {
+    throw new FileValidationError('FILE_READ', '当前模板存在多个大账号，请先选择本次使用的大账号');
   }
 
   let currencyMappings = [];
@@ -1932,8 +2382,14 @@ function prepareGeneratedFiles({
     accountMappingByBankId,
     currencyMappings,
     amountMappingRules: {
+      signedAmountSourceField: mappingByTargetField[SIGNED_AMOUNT_MAPPING_FIELD],
       nameSourceField: mappingByTargetField[AMOUNT_BASED_NAME_MAPPING_FIELD],
       accountSourceField: mappingByTargetField[AMOUNT_BASED_ACCOUNT_MAPPING_FIELD]
+    },
+    expectedSourceHeaders: template.headers,
+    selectedBigAccount: {
+      merchantId: selectedMerchantId,
+      currency: selectedCurrency
     }
   });
   const warnings = Array.isArray(detailRows.issues) ? detailRows.issues.slice() : [];
@@ -1976,6 +2432,7 @@ function prepareGeneratedFiles({
   const detailOutput = buildStatementOutputFilePath({
     kind: 'detail',
     templateName: template.name,
+    merchantId: selectedMerchantId,
     outputTag: 'COMMON',
     dateRangeLabel
   });
@@ -2036,6 +2493,7 @@ function prepareGeneratedFiles({
       const balanceOutput = buildStatementOutputFilePath({
         kind: 'balance',
         templateName: template.name,
+        merchantId: selectedMerchantId,
         outputTag: 'Balance',
         dateRangeLabel: buildDateRangeLabel(balanceResult.billDates)
       });
@@ -2231,6 +2689,7 @@ function registerFileHandlers() {
 
     try {
       clearPendingManualBalancePrompt();
+      clearPendingBigAccountSelection();
       templateConfig = getTemplateMappingConfig(templateId);
 
       if (!templateConfig) {
@@ -2252,18 +2711,34 @@ function registerFileHandlers() {
       }
 
       const inputFilePath = result.filePaths[0];
+      const bigAccountOptions = expandBigAccountConfigurations(templateConfig.bigAccounts);
+
+      if (bigAccountOptions.length) {
+        rememberPendingBigAccountSelection({
+          templateId,
+          template: templateConfig.template,
+          mappings: templateConfig.exportMappings,
+          orderedTargetFields: templateConfig.exportTargetFields,
+          inputFilePath,
+          options: bigAccountOptions
+        });
+        return buildBigAccountSelectionRequiredResult(bigAccountOptions);
+      }
+
       rememberLastFileImportContext({
         templateId,
         template: templateConfig.template,
         mappings: templateConfig.exportMappings,
         orderedTargetFields: templateConfig.exportTargetFields,
-        inputFilePath
+        inputFilePath,
+        selectedBigAccount: null
       });
       const generatedFiles = prepareGeneratedFiles({
         template: templateConfig.template,
         mappings: templateConfig.exportMappings,
         orderedTargetFields: templateConfig.exportTargetFields,
-        inputFilePath
+        inputFilePath,
+        selectedBigAccount: null
       });
       lastGeneratedExports = {
         detail: generatedFiles.detail,
@@ -2279,6 +2754,7 @@ function registerFileHandlers() {
     } catch (error) {
       clearGeneratedExports();
       clearPendingManualBalancePrompt();
+      clearPendingBigAccountSelection();
 
       if (error instanceof FileValidationError) {
         return createErrorResult({
@@ -2312,6 +2788,106 @@ function registerFileHandlers() {
         },
         originalError: error,
         templateName: templateConfig?.template?.name || ''
+      });
+    }
+  });
+
+  ipcMain.handle('file:complete-big-account-selection', (_event, payload = {}) => {
+    const pendingContext = lastPendingBigAccountSelection;
+
+    if (!pendingContext) {
+      return createErrorResult({
+        step: '选择大账号',
+        message: '当前没有待处理的大账号选择任务，请重新导入文件',
+        errorCode: 'BIG_ACCOUNT_SELECTION_MISSING'
+      });
+    }
+
+    const selectedMerchantId = normalizeCell(payload.merchantId);
+    const selectedCurrency = normalizeCell(payload.currency);
+    const selectedOption = pendingContext.options.find((option) => {
+      return option.merchantId === selectedMerchantId && option.currency === selectedCurrency;
+    });
+
+    if (!selectedOption) {
+      return createErrorResult({
+        step: '选择大账号',
+        message: '请选择有效的大账号 / 币种',
+        errorCode: 'BIG_ACCOUNT_SELECTION_INVALID',
+        templateName: pendingContext.template.name
+      });
+    }
+
+    try {
+      const selectedBigAccount = {
+        merchantId: selectedOption.merchantId,
+        currency: selectedOption.currency
+      };
+
+      rememberLastFileImportContext({
+        templateId: pendingContext.templateId,
+        template: pendingContext.template,
+        mappings: pendingContext.mappings,
+        orderedTargetFields: pendingContext.orderedTargetFields,
+        inputFilePath: pendingContext.inputFilePath,
+        selectedBigAccount
+      });
+      const generatedFiles = prepareGeneratedFiles({
+        template: pendingContext.template,
+        mappings: pendingContext.mappings,
+        orderedTargetFields: pendingContext.orderedTargetFields,
+        inputFilePath: pendingContext.inputFilePath,
+        selectedBigAccount
+      });
+      clearPendingBigAccountSelection();
+      lastGeneratedExports = {
+        detail: generatedFiles.detail,
+        balance: generatedFiles.balance,
+        newAccount: lastGeneratedExports.newAccount
+      };
+      return buildImportResultFromGeneratedFiles({
+        generatedFiles,
+        templateId: pendingContext.templateId,
+        templateName: pendingContext.template.name,
+        inputFilePath: pendingContext.inputFilePath
+      });
+    } catch (error) {
+      clearGeneratedExports();
+      clearPendingManualBalancePrompt();
+      clearPendingBigAccountSelection();
+
+      if (error instanceof FileValidationError) {
+        return createErrorResult({
+          step: '选择大账号',
+          message: error.message,
+          errorCode: error.code,
+          originalError: error,
+          detailLines: Array.isArray(error.detailLines) ? error.detailLines : [],
+          context: {
+            templateId: pendingContext.templateId,
+            templateName: pendingContext.template.name,
+            ...(error.context || {})
+          },
+          templateName: pendingContext.template.name
+        });
+      }
+
+      const logPath = appendLog(ensureStorageRoot(), error);
+      return createErrorResult({
+        step: '选择大账号',
+        message: '文件转换错误，请导出报错文件查看详情',
+        errorCode: 'BIG_ACCOUNT_SELECTION_RUNTIME',
+        errorType: '系统错误',
+        detailLines: [
+          '系统异常已额外写入日志文件。',
+          `日志文件：${logPath}`
+        ],
+        context: {
+          templateId: pendingContext.templateId,
+          templateName: pendingContext.template.name
+        },
+        originalError: error,
+        templateName: pendingContext.template.name
       });
     }
   });
@@ -2396,7 +2972,8 @@ function registerFileHandlers() {
         template: importContext.template,
         mappings: importContext.mappings,
         orderedTargetFields: importContext.orderedTargetFields,
-        inputFilePath: importContext.inputFilePath
+        inputFilePath: importContext.inputFilePath,
+        selectedBigAccount: importContext.selectedBigAccount
       });
       lastGeneratedExports = {
         detail: generatedFiles.detail,
@@ -2644,6 +3221,7 @@ app.whenReady().then(() => {
   const dataPath = path.join(app.getPath('userData'), 'tool-data.sqlite');
   database = new AppDatabase(dataPath);
   database.init();
+  syncTemplateLibraryFile();
   initializeActivityLog();
 
   registerWindowHandlers();

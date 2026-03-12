@@ -7,6 +7,7 @@
 ## 功能
 
 - 导入 Excel / CSV 作为模板文件。
+- 网银账单生成模块支持直接导入原始账单文件：系统会自动在第一个 sheet 中定位真实表头，清理前置说明行、左侧脏列和右侧空尾列后再继续转换。
 - 应用内置 `COMMON枚举.xlsx`，启动后自动加载网银账单枚举表。
 - 导入 Excel / CSV 账单文件并按映射替换表头。
 - 支持账户映射模块，将模板中映射为 `MerchantId` 的字段值按大账户映射表转换为清结算系统大账户ID。
@@ -24,6 +25,10 @@
 - 本地余额种子保存在 `文档/网银账单生成小助手/balance-seeds/`；文件按银行拆分，记录键为 `MerchantId + Currency + BillDate`，并带有 `生成方式` 字段。
 - 当模板启用了 `Balance` 时，`MerchantId` 必须映射且导入值不能为空，否则余额账单不会生成。
 - `Balance` 映射新增固定选项 `通过发生额计算`；启用后会按 `上一账单日余额 + Credit Amount 汇总 - Debit Amount 汇总` 生成余额账单。
+- 映射关系管理新增 `按正负号拆分的发生额`；对于单列带正负号的原始发生额，可自动拆分为 `Credit Amount` / `Debit Amount`。
+- `BillDate` / `ValueDate` 会自动清理时分秒、补齐年月日位数，并在导出时按 `YYYY-MM-DD`、`YYYY/MM/DD`、`YYYYMMDD` 之一写出显示格式。
+- 模板管理页新增 `大账号` 列和 `重命名`；`MerchantId` 选择 `自己输入` 后，可切换为“模板里存在多个大账号”模式，维护多个“大账号 + 币种”配置，并在导入时选择本次使用的组合。
+- 模板会自动同步到 `文档/网银账单生成小助手/templates/template-library.json`，并支持 JSON 模板包导入与导出。
 - “新开账户生成网银账单”模块导出文件命名规则为 `银行名称-所在地-银行账号-币种-NEW_BALANCE.xlsx`；多币种账户时，其中“币种”固定输出为 `多币种`。
 - “新开账户生成网银账单”模块支持多币种账户模式；勾选后可从 `币种映射表.xlsx` 的 C 列多选币种并批量生成多行余额账单。
 - 所有用户侧报错都会生成详细报错文件，状态框可点击导出；报错文件名规则为 `YYYYMMDD-HHMMSS-模板名-错误步骤.txt`。
@@ -66,8 +71,8 @@ npm run dist:win
 默认会同时生成安装包和免安装可执行文件：
 
 ```bash
-dist/网银账单小助手-1.2.13-setup.exe
-dist/网银账单小助手-1.2.13-portable.exe
+dist/网银账单小助手-1.3.0-setup.exe
+dist/网银账单小助手-1.3.0-portable.exe
 ```
 
 如果只想生成免安装的单文件 exe：
@@ -101,6 +106,7 @@ npm run dist:win:setup
 - 日志目录：`文档/网银账单生成小助手/logs`
 - 报错文件目录：`文档/网银账单生成小助手/error-reports/执行日期`
 - 本地余额种子目录：`文档/网银账单生成小助手/balance-seeds`
+- 模板库文件：`文档/网银账单生成小助手/templates/template-library.json`
 - 应用运行日志：`文档/网银账单生成小助手/app_activity_log.txt`
 - SQLite 数据库：Electron `userData` 目录下的 `tool-data.sqlite`
 

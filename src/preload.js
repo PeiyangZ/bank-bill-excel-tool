@@ -29,10 +29,14 @@ contextBridge.exposeInMainWorld('desktopApi', {
     importTemplate: () => ipcRenderer.invoke('template:import'),
     deleteTemplate: (templateId) => ipcRenderer.invoke('template:delete', templateId),
     getMappings: (templateId) => ipcRenderer.invoke('template:get-mappings', templateId),
-    saveMappings: (payload) => ipcRenderer.invoke('template:save-mappings', payload)
+    saveMappings: (payload) => ipcRenderer.invoke('template:save-mappings', payload),
+    rename: (payload) => ipcRenderer.invoke('template:rename', payload),
+    exportBundle: () => ipcRenderer.invoke('template:export-bundle'),
+    importBundle: () => ipcRenderer.invoke('template:import-bundle')
   },
   files: {
     importFile: (templateId) => ipcRenderer.invoke('file:import', templateId),
+    completeBigAccountSelection: (payload) => ipcRenderer.invoke('file:complete-big-account-selection', payload),
     saveBalanceSeed: (payload) => ipcRenderer.invoke('file:save-balance-seed', payload),
     exportDetail: () => ipcRenderer.invoke('file:export-detail'),
     exportBalance: () => ipcRenderer.invoke('file:export-balance')

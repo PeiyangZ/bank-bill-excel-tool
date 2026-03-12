@@ -855,6 +855,12 @@ select {
   min-width: 220px;
 }
 
+.mapping-custom-input-compact {
+  flex: 0 0 140px;
+  min-width: 140px;
+  max-width: 140px;
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -878,6 +884,15 @@ select {
   display: flex;
   gap: 16px;
   align-items: center;
+}
+
+.manager-action-header,
+.manager-action-cell {
+  padding-right: 1cm;
+}
+
+.manager-action-cell {
+  justify-content: flex-end;
 }
 
 .add-row td {
@@ -919,6 +934,73 @@ select {
 .dialog-actions.right {
   justify-content: flex-end;
   margin-top: 18px;
+}
+
+.dialog-actions.split {
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 18px;
+}
+
+.mapping-big-account-label {
+  white-space: nowrap;
+}
+
+.mapping-big-account-label-text {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.mapping-big-account-manage-btn {
+  min-width: 120px;
+}
+
+.big-account-card {
+  width: min(100%, 980px);
+}
+
+.big-account-currency-editor {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.big-account-currency-select {
+  min-width: 150px;
+}
+
+.big-account-currency-dropdown-wrap {
+  position: relative;
+  width: 168px;
+}
+
+.big-account-currency-dropdown-btn {
+  width: 100%;
+}
+
+.big-account-currency-dropdown-panel {
+  min-width: 100%;
+}
+
+.big-account-multi-label {
+  color: var(--muted);
+}
+
+.big-account-selection-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.big-account-selection-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(104, 79, 39, 0.12);
+  border-radius: 12px;
+  background: rgba(255, 250, 241, 0.7);
 }
 
 @media (max-width: 1080px) {

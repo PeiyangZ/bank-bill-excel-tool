@@ -48,8 +48,10 @@ function run() {
   const dataPath = path.join(root, 'input.xlsx');
   const unmappedDataPath = path.join(root, 'input-unmapped.xlsx');
   const amountMappingDataPath = path.join(root, 'amount-mapping-input.xlsx');
+  const signedAmountDataPath = path.join(root, 'input-signed-amount.xlsx');
   const simultaneousAmountDataPath = path.join(root, 'input-simultaneous.xlsx');
   const skippedAmountDataPath = path.join(root, 'input-skipped-amounts.xlsx');
+  const rawStatementPath = path.join(root, 'input-raw-statement.xlsx');
   const detailOutputPath = path.join(root, '2026-03-09', 'detail', 'template-COMMON-2026-03-09~2026-03-10.xlsx');
   const balanceTemplatePath = path.join(root, 'balance-template.xlsx');
   const balanceOutputPath = path.join(root, '2026-03-09', 'balance', 'template-Balance-2026-03-09.xlsx');
@@ -75,6 +77,11 @@ function run() {
     ['收款户名', '收款账号', '100', '', '2026-03-09'],
     ['付款户名', '付款账号', '', '200', '2026-03-10']
   ]);
+  makeWorkbook(signedAmountDataPath, [
+    ['账单日期', '发生额', '银行账号'],
+    ['26-1-1 09:01:19', '+123.45', 'NET_001'],
+    ['2026/1/2 09:01:19', '-54.3', 'NET_001']
+  ]);
   makeWorkbook(simultaneousAmountDataPath, [
     ['原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H'],
     ['100', '200', '2026-03-09', '20260310', 'NET_001', 88, '美元', '456.78']
@@ -84,6 +91,12 @@ function run() {
     ['100', '', '2026-03-09', '20260310', 'NET_001', 88, '美元', '456.78'],
     ['', '', '2026-03-10', '20260311', 'NET_001', 88, '美元', '460.00'],
     ['0', '0', '2026-03-11', '20260312', 'NET_001', 88, '美元', '470.00']
+  ]);
+  makeWorkbook(rawStatementPath, [
+    ['账户信息', '', '', '', '', '', '', '', '', ''],
+    ['', '原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H', '脏列'],
+    ['', '$1,234.56CR', '', '2026-03-09', '20260310', 'NET_001', 88, '美元', 'BAL 456.78元', '忽略'],
+    ['', '', 'DB789.01元', '2026-03-10', '20260311', 'NET_002', 99, '港元', '99.99', '忽略']
   ]);
   makeWorkbook(balanceTemplatePath, [
     ['银行名称', '所在地', '币种', '银行账号', '账单日期', '期初余额', '期初可用余额', '期末余额', '期末可用余额', '扩展字段'],
@@ -98,6 +111,13 @@ function run() {
 
   const template = db.upsertTemplate({
     name: 'template',
+    sourceFileName: 'template.xlsx',
+    headers
+  });
+  assert(template.templateKey);
+
+  const multiTemplate = db.upsertTemplate({
+    name: 'multi-template',
     sourceFileName: 'template.xlsx',
     headers
   });
@@ -116,6 +136,14 @@ function run() {
     { templateField: '原字段D', mappedField: 'ValueDate' },
     { templateField: '原字段E', mappedField: 'MerchantId' },
     { templateField: '原字段F', mappedField: 'Channel' }
+  ]);
+  db.saveMappings(multiTemplate.id, [
+    { templateField: 'MerchantId', mappedField: `${FIXED_FIELD_VALUE_PREFIX}__MULTI_BIG_ACCOUNT__` },
+    { templateField: 'Currency', mappedField: `${FIXED_FIELD_VALUE_PREFIX}USD` }
+  ], [
+    { merchantId: 'BIG_001', currency: 'USD' },
+    { merchantId: 'BIG_001', currency: 'HKD' },
+    { merchantId: 'BIG_002', currency: 'USD' }
   ]);
   db.saveAccountMappings([
     {
@@ -136,6 +164,9 @@ function run() {
   assert(enumValues.includes('MerchantId'));
   assert.strictEqual(enumValues.includes('COMMON字段'), false);
   assert(currencyMappings.length > 0);
+  assert.strictEqual(db.listTemplates().find((item) => item.name === 'multi-template').bigAccountSummary, '2个');
+  assert.strictEqual(db.getTemplateMappings(multiTemplate.id).bigAccounts.length, 2);
+  assert.deepStrictEqual(db.getTemplateMappings(multiTemplate.id).bigAccounts[0].currencies, ['USD', 'HKD']);
 
   const detailRows = buildMappedRows({
     inputFilePath: dataPath,
@@ -233,6 +264,45 @@ function run() {
   assert.strictEqual(amountMappingRows[2][4], '');
   assert.strictEqual(amountMappingRows[2][5], '付款户名');
   assert.strictEqual(amountMappingRows[2][6], '付款账号');
+
+  const signedAmountRows = buildMappedRows({
+    inputFilePath: signedAmountDataPath,
+    mappingByField: {
+      BillDate: '账单日期',
+      MerchantId: '银行账号',
+      Currency: `${FIXED_FIELD_VALUE_PREFIX}USD`
+    },
+    orderedTargetFields: ['BillDate', 'MerchantId', 'Currency', 'Credit Amount', 'Debit Amount'],
+    amountMappingRules: {
+      signedAmountSourceField: '发生额'
+    }
+  });
+  assert.strictEqual(signedAmountRows[1][0], '2026-01-01');
+  assert.strictEqual(signedAmountRows[1][3], '123.45');
+  assert.strictEqual(signedAmountRows[1][4], '');
+  assert.strictEqual(signedAmountRows[2][0], '2026-01-02');
+  assert.strictEqual(signedAmountRows[2][3], '');
+  assert.strictEqual(signedAmountRows[2][4], '54.3');
+
+  const rawStatementRows = buildMappedRows({
+    inputFilePath: rawStatementPath,
+    expectedSourceHeaders: headers,
+    mappingByField: {
+      Balance: '原字段H',
+      BillDate: '原字段C',
+      ValueDate: '原字段D',
+      Channel: `${FIXED_FIELD_VALUE_PREFIX}CHB`,
+      MerchantId: `${FIXED_FIELD_VALUE_PREFIX}SELF_INPUT_001`,
+      Currency: '原字段G',
+      'Credit Amount': '原字段A',
+      'Debit Amount': '原字段B'
+    },
+    orderedTargetFields: ['Balance', 'BillDate', 'ValueDate', 'Channel', 'MerchantId', 'Currency', 'Credit Amount', 'Debit Amount'],
+    currencyMappings
+  });
+  assert.strictEqual(rawStatementRows.rowMetas[0].sourceRowNumber, 3);
+  assert.strictEqual(rawStatementRows[1][0], '456.78');
+  assert.strictEqual(rawStatementRows[2][0], '99.99');
 
   const simultaneousAmountRows = buildMappedRows({
     inputFilePath: simultaneousAmountDataPath,
@@ -342,7 +412,7 @@ function run() {
   assert.strictEqual(worksheet.A2.t, 'n');
   assert.strictEqual(worksheet.A2.z, 'yyyy-mm-dd');
   assert.strictEqual(worksheet.B2.t, 'n');
-  assert.strictEqual(worksheet.B2.z, 'yyyy-mm-dd');
+  assert.strictEqual(worksheet.B2.z, 'yyyymmdd');
   assert.strictEqual(worksheet.C2.t, 's');
   assert.strictEqual(worksheet.C2.z, '@');
   assert.strictEqual(worksheet.D2.t, 's');

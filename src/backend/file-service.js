@@ -27,6 +27,22 @@ function isRowMeaningful(row) {
   return Array.isArray(row) && row.some((cell) => normalizeCell(cell) !== '');
 }
 
+function trimTrailingEmptyCells(row) {
+  if (!Array.isArray(row)) {
+    return [];
+  }
+
+  const lastMeaningfulIndex = row.reduce((index, cell, currentIndex) => {
+    return normalizeCell(cell) !== '' ? currentIndex : index;
+  }, -1);
+
+  if (lastMeaningfulIndex < 0) {
+    return [];
+  }
+
+  return row.slice(0, lastMeaningfulIndex + 1);
+}
+
 function ensureSupportedFile(filePath) {
   const extension = path.extname(filePath).toLowerCase();
 
@@ -35,7 +51,7 @@ function ensureSupportedFile(filePath) {
   }
 }
 
-function readRows(filePath) {
+function readWorkbookRows(filePath, { blankrows = false } = {}) {
   ensureSupportedFile(filePath);
 
   if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
@@ -55,17 +71,11 @@ function readRows(filePath) {
     }
 
     const sheet = workbook.Sheets[firstSheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, {
+    return XLSX.utils.sheet_to_json(sheet, {
       header: 1,
-      blankrows: false,
+      blankrows,
       defval: ''
     });
-
-    if (!Array.isArray(rows) || rows.length === 0 || !rows.some(isRowMeaningful)) {
-      throw new FileValidationError('FILE_READ', '文件为空或不可读，请重新导入');
-    }
-
-    return rows;
   } catch (error) {
     if (error instanceof FileValidationError) {
       throw error;
@@ -73,6 +83,92 @@ function readRows(filePath) {
 
     throw new FileValidationError('FILE_READ', '文件为空或不可读，请重新导入');
   }
+}
+
+function readRows(filePath) {
+  const rows = readWorkbookRows(filePath, { blankrows: false });
+
+  if (!Array.isArray(rows) || rows.length === 0 || !rows.some(isRowMeaningful)) {
+    throw new FileValidationError('FILE_READ', '文件为空或不可读，请重新导入');
+  }
+
+  return rows;
+}
+
+function readRowsWithMetadata(filePath, expectedHeaders = []) {
+  const rawRows = readWorkbookRows(filePath, { blankrows: true });
+  const normalizedExpectedHeaders = Array.isArray(expectedHeaders)
+    ? expectedHeaders.map((header) => normalizeCell(header)).filter((header) => header !== '')
+    : [];
+  const meaningfulRows = rawRows
+    .map((row, index) => ({
+      rowNumber: index + 1,
+      cells: trimTrailingEmptyCells(Array.isArray(row) ? row : [])
+    }))
+    .filter((row) => isRowMeaningful(row.cells));
+
+  if (!meaningfulRows.length) {
+    throw new FileValidationError('FILE_READ', '文件为空或不可读，请重新导入');
+  }
+
+  if (!normalizedExpectedHeaders.length) {
+    return {
+      rows: meaningfulRows.map((row) => row.cells),
+      rowNumbers: meaningfulRows.map((row) => row.rowNumber)
+    };
+  }
+
+  const expectedHeaderCount = normalizedExpectedHeaders.length;
+  let matchedRowIndex = -1;
+  let matchedColumnIndex = -1;
+
+  meaningfulRows.some((row, rowIndex) => {
+    const maximumStartIndex = row.cells.length - expectedHeaderCount;
+
+    for (let startIndex = 0; startIndex <= maximumStartIndex; startIndex += 1) {
+      const candidateHeaders = row.cells
+        .slice(startIndex, startIndex + expectedHeaderCount)
+        .map((cell) => normalizeCell(cell));
+
+      if (candidateHeaders.every((cell, index) => cell === normalizedExpectedHeaders[index])) {
+        matchedRowIndex = rowIndex;
+        matchedColumnIndex = startIndex;
+        return true;
+      }
+    }
+
+    return false;
+  });
+
+  if (matchedRowIndex < 0 || matchedColumnIndex < 0) {
+    throw new FileValidationError(
+      'FILE_READ',
+      '当前导入文件未匹配到所选模板的表头，请确认模板或原始网银账单是否正确'
+    );
+  }
+
+  const rows = [];
+  const rowNumbers = [];
+
+  meaningfulRows.slice(matchedRowIndex).forEach((row, index) => {
+    const normalizedCells = row.cells.slice(matchedColumnIndex, matchedColumnIndex + expectedHeaderCount);
+
+    while (normalizedCells.length < expectedHeaderCount) {
+      normalizedCells.push('');
+    }
+
+    if (index > 0 && !isRowMeaningful(normalizedCells)) {
+      return;
+    }
+
+    rows.push(normalizedCells);
+    rowNumbers.push(row.rowNumber);
+  });
+
+  return {
+    rows,
+    rowNumbers
+  };
 }
 
 function extractHeaders(filePath) {
@@ -153,7 +249,7 @@ function parseNumericValue(value) {
     return null;
   }
 
-  if (!/^-?\d+(\.\d+)?$/.test(normalized)) {
+  if (!/^[+-]?\d+(\.\d+)?$/.test(normalized)) {
     return null;
   }
 
@@ -359,66 +455,285 @@ function resolveCurrencyValue(rawValue, currencyMappings = []) {
   };
 }
 
-function parseDateValue(value) {
+function sanitizeSignedAmountValue(value) {
   if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  const normalized = String(value).replace(/[^0-9.+-]/g, '');
+
+  if (!normalized) {
+    return '';
+  }
+
+  const signMatch = normalized.match(/^[+-]/);
+  const sign = signMatch ? signMatch[0] : '';
+  const unsignedValue = normalized.replace(/^[+-]/, '').replace(/[+-]/g, '');
+  const firstDotIndex = unsignedValue.indexOf('.');
+  const sanitizedNumber = firstDotIndex < 0
+    ? unsignedValue
+    : `${unsignedValue.slice(0, firstDotIndex + 1)}${unsignedValue.slice(firstDotIndex + 1).replace(/\./g, '')}`;
+
+  if (!sanitizedNumber || sanitizedNumber === '.') {
+    return '';
+  }
+
+  const normalizedNumber = sanitizedNumber.startsWith('.') ? `0${sanitizedNumber}` : sanitizedNumber;
+  return `${sign}${normalizedNumber}`;
+}
+
+function splitSignedAmountValue(rawValue) {
+  const sanitizedValue = sanitizeSignedAmountValue(rawValue);
+
+  if (!sanitizedValue) {
+    return {
+      creditAmount: '',
+      debitAmount: '',
+      hasCreditAmount: false,
+      hasDebitAmount: false
+    };
+  }
+
+  const numericValue = parseNumericValue(sanitizedValue);
+
+  if (numericValue === null || numericValue === 0) {
+    return {
+      creditAmount: '',
+      debitAmount: '',
+      hasCreditAmount: false,
+      hasDebitAmount: false
+    };
+  }
+
+  if (numericValue < 0) {
+    const normalizedValue = String(Math.abs(numericValue));
+    return {
+      creditAmount: '',
+      debitAmount: normalizedValue,
+      hasCreditAmount: false,
+      hasDebitAmount: true
+    };
+  }
+
+  return {
+    creditAmount: String(numericValue),
+    debitAmount: '',
+    hasCreditAmount: true,
+    hasDebitAmount: false
+  };
+}
+
+function buildDateObject(year, month, day) {
+  const normalizedYear = Number(year);
+  const normalizedMonth = Number(month);
+  const normalizedDay = Number(day);
+
+  if (!Number.isInteger(normalizedYear) || !Number.isInteger(normalizedMonth) || !Number.isInteger(normalizedDay)) {
     return null;
   }
 
+  const date = new Date(normalizedYear, normalizedMonth - 1, normalizedDay);
+
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.getFullYear() !== normalizedYear ||
+    date.getMonth() !== normalizedMonth - 1 ||
+    date.getDate() !== normalizedDay
+  ) {
+    return null;
+  }
+
+  return date;
+}
+
+function stripDateTimeSuffix(rawValue) {
+  const normalizedValue = normalizeCell(rawValue);
+
+  if (!normalizedValue) {
+    return '';
+  }
+
+  const withoutIsoTime = normalizedValue.replace(/[Tt]\d{1,2}:\d{1,2}(:\d{1,2})?.*$/, '');
+  return withoutIsoTime.split(/\s+/)[0] || withoutIsoTime;
+}
+
+function normalizeDateExportValue(value) {
+  if (value === null || value === undefined || value === '') {
+    return {
+      value: '',
+      date: null,
+      displayFormat: 'yyyy-mm-dd'
+    };
+  }
+
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+    const date = new Date(value.getFullYear(), value.getMonth(), value.getDate());
+    return {
+      value: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`,
+      date,
+      displayFormat: 'yyyy-mm-dd'
+    };
   }
 
   if (typeof value === 'number' && Number.isFinite(value)) {
     const parsed = XLSX.SSF.parse_date_code(value);
 
     if (!parsed) {
-      return null;
+      return {
+        value: '',
+        date: null,
+        displayFormat: 'yyyy-mm-dd'
+      };
     }
 
-    return new Date(parsed.y, parsed.m - 1, parsed.d);
+    const date = buildDateObject(parsed.y, parsed.m, parsed.d);
+    return {
+      value: date
+        ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+        : '',
+      date,
+      displayFormat: 'yyyy-mm-dd'
+    };
   }
 
-  const normalized = normalizeCell(value)
+  const candidateValue = stripDateTimeSuffix(value);
+
+  if (!candidateValue) {
+    return {
+      value: '',
+      date: null,
+      displayFormat: 'yyyy-mm-dd'
+    };
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(candidateValue)) {
+    const date = buildDateObject(
+      candidateValue.slice(0, 4),
+      candidateValue.slice(5, 7),
+      candidateValue.slice(8, 10)
+    );
+    return {
+      value: date ? candidateValue : '',
+      date,
+      displayFormat: 'yyyy-mm-dd'
+    };
+  }
+
+  if (/^\d{4}\/\d{2}\/\d{2}$/.test(candidateValue)) {
+    const date = buildDateObject(
+      candidateValue.slice(0, 4),
+      candidateValue.slice(5, 7),
+      candidateValue.slice(8, 10)
+    );
+    return {
+      value: date ? candidateValue : '',
+      date,
+      displayFormat: 'yyyy/mm/dd'
+    };
+  }
+
+  if (/^\d{8}$/.test(candidateValue)) {
+    const date = buildDateObject(
+      candidateValue.slice(0, 4),
+      candidateValue.slice(4, 6),
+      candidateValue.slice(6, 8)
+    );
+    return {
+      value: date ? candidateValue : '',
+      date,
+      displayFormat: 'yyyymmdd'
+    };
+  }
+
+  const normalizedValue = candidateValue
     .replaceAll('年', '-')
     .replaceAll('月', '-')
     .replaceAll('日', '')
     .replaceAll('/', '-')
     .replaceAll('.', '-');
+  let matchedParts = normalizedValue.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
 
-  if (/^\d{8}$/.test(normalized)) {
-    const year = Number(normalized.slice(0, 4));
-    const month = Number(normalized.slice(4, 6));
-    const day = Number(normalized.slice(6, 8));
-    const date = new Date(year, month - 1, day);
-
-    if (!Number.isNaN(date.getTime())) {
-      return date;
-    }
+  if (matchedParts) {
+    const date = buildDateObject(matchedParts[1], matchedParts[2], matchedParts[3]);
+    return {
+      value: date
+        ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+        : '',
+      date,
+      displayFormat: 'yyyy-mm-dd'
+    };
   }
 
-  const match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  matchedParts = normalizedValue.match(/^(\d{2})-(\d{1,2})-(\d{1,2})$/);
 
-  if (match) {
-    const [, year, month, day] = match;
-    const date = new Date(Number(year), Number(month) - 1, Number(day));
-
-    if (!Number.isNaN(date.getTime())) {
-      return date;
-    }
+  if (matchedParts) {
+    const fullYear = `20${matchedParts[1]}`;
+    const date = buildDateObject(fullYear, matchedParts[2], matchedParts[3]);
+    return {
+      value: date
+        ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+        : '',
+      date,
+      displayFormat: 'yyyy-mm-dd'
+    };
   }
 
-  const fallback = new Date(normalized);
+  if (/^\d{6}$/.test(normalizedValue)) {
+    const fullYear = `20${normalizedValue.slice(0, 2)}`;
+    const date = buildDateObject(fullYear, normalizedValue.slice(2, 4), normalizedValue.slice(4, 6));
+    return {
+      value: date
+        ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+        : '',
+      date,
+      displayFormat: 'yyyy-mm-dd'
+    };
+  }
+
+  const fallback = new Date(candidateValue);
+
   if (!Number.isNaN(fallback.getTime())) {
-    return new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
+    const date = new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
+    return {
+      value: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`,
+      date,
+      displayFormat: 'yyyy-mm-dd'
+    };
   }
 
-  return null;
+  return {
+    value: '',
+    date: null,
+    displayFormat: 'yyyy-mm-dd'
+  };
+}
+
+function parseDateValue(value) {
+  return normalizeDateExportValue(value).date;
 }
 
 function toExcelSerial(date) {
   const utcValue = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
   const excelEpoch = Date.UTC(1899, 11, 30);
   return (utcValue - excelEpoch) / 86400000;
+}
+
+function inferDateCellFormat(value) {
+  const normalizedValue = normalizeCell(value);
+
+  if (/^\d{8}$/.test(normalizedValue)) {
+    return 'yyyymmdd';
+  }
+
+  if (/^\d{4}\/\d{2}\/\d{2}$/.test(normalizedValue)) {
+    return 'yyyy/mm/dd';
+  }
+
+  return 'yyyy-mm-dd';
 }
 
 function applyExportFieldFormats(worksheet, rows) {
@@ -471,7 +786,7 @@ function applyExportFieldFormats(worksheet, rows) {
         worksheet[cellAddress] = {
           t: 'n',
           v: toExcelSerial(dateValue),
-          z: 'yyyy-mm-dd'
+          z: inferDateCellFormat(row[columnIndex])
         };
       });
     });
@@ -544,7 +859,7 @@ function applyBalanceFieldFormats(worksheet, headerFields, rows) {
         worksheet[cellAddress] = {
           t: 'n',
           v: toExcelSerial(dateValue),
-          z: 'yyyy-mm-dd'
+          z: inferDateCellFormat(row[columnIndex])
         };
       });
     });
@@ -574,15 +889,20 @@ function buildMappedRows({
   mappingByField,
   accountMappingByBankId = {},
   currencyMappings = [],
-  amountMappingRules = {}
+  amountMappingRules = {},
+  expectedSourceHeaders = [],
+  selectedBigAccount = null
 }) {
-  const rows = readRows(inputFilePath);
+  const { rows, rowNumbers } = readRowsWithMetadata(inputFilePath, expectedSourceHeaders);
   const sourceHeaders = rows[0] || [];
   const sourceIndexByField = new Map();
   const issues = [];
   const rowMetas = [];
   const nameSourceField = normalizeCell(amountMappingRules.nameSourceField);
   const accountSourceField = normalizeCell(amountMappingRules.accountSourceField);
+  const signedAmountSourceField = normalizeCell(amountMappingRules.signedAmountSourceField);
+  const selectedMerchantId = normalizeCell(selectedBigAccount?.merchantId);
+  const selectedCurrency = normalizeCell(selectedBigAccount?.currency);
 
   sourceHeaders.forEach((header, index) => {
     const normalizedHeader = normalizeCell(header);
@@ -609,11 +929,26 @@ function buildMappedRows({
   }
 
   rows.slice(1).forEach((row, rowIndex) => {
-    const hasCreditAmount = hasEffectiveAmount(resolveRawValueByMapping(mappingByField['Credit Amount'], row));
-    const hasDebitAmount = hasEffectiveAmount(resolveRawValueByMapping(mappingByField['Debit Amount'], row));
+    const directCreditAmountRaw = resolveRawValueByMapping(mappingByField['Credit Amount'], row);
+    const directDebitAmountRaw = resolveRawValueByMapping(mappingByField['Debit Amount'], row);
+    const signedAmountValue = signedAmountSourceField
+      ? splitSignedAmountValue(resolveRawValueByMapping(signedAmountSourceField, row))
+      : null;
+    const creditAmountValue = signedAmountValue
+      ? signedAmountValue.creditAmount
+      : sanitizeAmountValue(directCreditAmountRaw);
+    const debitAmountValue = signedAmountValue
+      ? signedAmountValue.debitAmount
+      : sanitizeAmountValue(directDebitAmountRaw);
+    const hasCreditAmount = signedAmountValue
+      ? signedAmountValue.hasCreditAmount
+      : hasEffectiveAmount(directCreditAmountRaw);
+    const hasDebitAmount = signedAmountValue
+      ? signedAmountValue.hasDebitAmount
+      : hasEffectiveAmount(directDebitAmountRaw);
 
     rowMetas.push({
-      sourceRowNumber: rowIndex + 2
+      sourceRowNumber: rowNumbers[rowIndex + 1] || rowIndex + 2
     });
 
     const mappedRow = orderedTargetFields.map((targetField) => {
@@ -632,8 +967,16 @@ function buildMappedRows({
         return sanitizeAmountValue(rawValue);
       }
 
-      if (targetField === 'Credit Amount' || targetField === 'Debit Amount') {
-        return sanitizeAmountValue(rawValue);
+      if (targetField === 'Credit Amount') {
+        return creditAmountValue;
+      }
+
+      if (targetField === 'Debit Amount') {
+        return debitAmountValue;
+      }
+
+      if (targetField === 'BillDate' || targetField === 'ValueDate') {
+        return normalizeDateExportValue(rawValue).value;
       }
 
       if (nameSourceField && mappingValue === nameSourceField) {
@@ -657,12 +1000,16 @@ function buildMappedRows({
       }
 
       if (targetField === 'Currency') {
+        if (selectedCurrency) {
+          return selectedCurrency;
+        }
+
         const currencyResult = resolveCurrencyValue(rawValue, currencyMappings);
 
         if (currencyResult.issue) {
           issues.push({
             ...currencyResult.issue,
-            rowNumber: rowIndex + 2,
+            rowNumber: rowNumbers[rowIndex + 1] || rowIndex + 2,
             sourceField
           });
         }
@@ -671,6 +1018,10 @@ function buildMappedRows({
       }
 
       if (targetField === 'MerchantId') {
+        if (selectedMerchantId) {
+          return selectedMerchantId;
+        }
+
         const originalValue = normalizeCell(rawValue);
 
         if (!originalValue) {

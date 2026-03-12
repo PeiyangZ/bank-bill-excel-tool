@@ -10,9 +10,14 @@ const BACKGROUND_FILE_HINT = '支持 PNG/JPG/JPEG/WEBP，大小不超过 5MB，�
 const BALANCE_DISABLED_OPTION = '无';
 const BALANCE_CALCULATED_OPTION = '通过发生额计算';
 const MERCHANT_ID_SELF_INPUT_OPTION = '自己输入';
+const SIGNED_AMOUNT_MAPPING_FIELD = '按正负号拆分的发生额';
 const AMOUNT_BASED_NAME_MAPPING_FIELD = '根据发生额做映射的户名';
 const AMOUNT_BASED_ACCOUNT_MAPPING_FIELD = '根据发生额做映射的账户号';
-const ADVANCED_MAPPING_FIELDS = [AMOUNT_BASED_NAME_MAPPING_FIELD, AMOUNT_BASED_ACCOUNT_MAPPING_FIELD];
+const ADVANCED_MAPPING_FIELDS = [
+  SIGNED_AMOUNT_MAPPING_FIELD,
+  AMOUNT_BASED_NAME_MAPPING_FIELD,
+  AMOUNT_BASED_ACCOUNT_MAPPING_FIELD
+];
 const MODULES = Object.freeze({
   statementGenerator: {
     id: 'statement-generator',
@@ -925,6 +930,315 @@ async function refreshTemplates() {
   updateTemplateSelect();
 }
 
+function cloneBigAccountItems(bigAccounts = []) {
+  return bigAccounts.map((item) => ({
+    merchantId: String(item.merchantId || ''),
+    currencies: Array.isArray(item.currencies) ? item.currencies.slice() : [],
+    isMultiCurrency: Boolean(item.isMultiCurrency)
+  }));
+}
+
+function collectMappingDraftFromTable(tableBody) {
+  return Array.from(tableBody.querySelectorAll('tr[data-template-field]')).map((row) => {
+    const select = row.querySelector('.mapping-select');
+    const customInput = row.querySelector('.mapping-custom-input');
+    const bigAccountToggle = row.querySelector('.mapping-big-account-toggle');
+
+    return {
+      templateField: row.dataset.templateField,
+      mappedField: select ? select.value : '',
+      customValue: customInput ? customInput.value : '',
+      isMultiBigAccount: bigAccountToggle ? bigAccountToggle.checked : false
+    };
+  });
+}
+
+function createTemplateRenameDialog(template) {
+  const overlay = createOverlay();
+  const dialog = document.createElement('div');
+  dialog.className = 'modal-card manual-balance-card';
+  dialog.innerHTML = `
+    <div class="dialog-header">
+      <div class="dialog-title">重命名模板</div>
+      <button class="icon-close" type="button">×</button>
+    </div>
+    <div class="manual-balance-form">
+      <label class="manual-balance-row">
+        <span class="manual-balance-label">当前模板名称</span>
+        <input class="mapping-text-input manual-balance-input" type="text" value="${escapeHtml(template.name)}" disabled />
+      </label>
+      <label class="manual-balance-row">
+        <span class="manual-balance-label">新模板名称</span>
+        <input class="mapping-text-input manual-balance-input rename-template-input" type="text" spellcheck="false" value="${escapeHtml(template.name)}" />
+      </label>
+    </div>
+    <div class="dialog-actions right">
+      <button class="primary-btn small" type="button" data-action="done">完成</button>
+    </div>
+  `;
+
+  const input = dialog.querySelector('.rename-template-input');
+  dialog.querySelector('.icon-close').addEventListener('click', () => {
+    openModal(createTemplateManagerDialog());
+  });
+  dialog.querySelector('[data-action="done"]').addEventListener('click', async () => {
+    const result = await window.desktopApi.templates.rename({
+      templateId: template.id,
+      name: input.value
+    });
+
+    setStatus(result.message, result.status === 'success' ? 'success' : 'error', {
+      errorReportReady: Boolean(result.errorReportReady)
+    });
+
+    if (result.status === 'success') {
+      await refreshTemplates();
+      openModal(createTemplateManagerDialog());
+      return;
+    }
+
+    openModal(createAlertDialog(result.message));
+  });
+
+  overlay.appendChild(dialog);
+  return overlay;
+}
+
+function createBigAccountSelectionDialog(options) {
+  const overlay = createOverlay();
+  const dialog = document.createElement('div');
+  dialog.className = 'modal-card manual-balance-card';
+  dialog.innerHTML = `
+    <div class="dialog-header">
+      <div class="dialog-title">请选择本次使用的大账号 / 币种</div>
+      <button class="icon-close" type="button">×</button>
+    </div>
+    <div class="big-account-selection-list"></div>
+    <div class="dialog-actions right">
+      <button class="primary-btn small" type="button" data-action="done">完成</button>
+    </div>
+  `;
+
+  const list = dialog.querySelector('.big-account-selection-list');
+  const radioName = `big-account-selection-${Date.now()}`;
+
+  options.forEach((option, index) => {
+    const label = document.createElement('label');
+    label.className = 'big-account-selection-item';
+    label.innerHTML = `
+      <input class="new-account-checkbox" type="radio" name="${radioName}" value="${index}" />
+      <span>${escapeHtml(option.label)}</span>
+    `;
+    list.appendChild(label);
+  });
+
+  dialog.querySelector('.icon-close').addEventListener('click', closeModal);
+  dialog.querySelector('[data-action="done"]').addEventListener('click', async () => {
+    const checked = list.querySelector(`input[name="${radioName}"]:checked`);
+
+    if (!checked) {
+      setStatus('请选择本次使用的大账号 / 币种', 'error');
+      return;
+    }
+
+    const selectedOption = options[Number(checked.value)];
+    const result = await window.desktopApi.files.completeBigAccountSelection({
+      merchantId: selectedOption.merchantId,
+      currency: selectedOption.currency
+    });
+
+    closeModal();
+    applyStatementResult(result);
+
+    if (result.status === 'error' && !result.manualBalancePromptReady) {
+      openModal(createAlertDialog(result.message));
+    }
+  });
+
+  overlay.appendChild(dialog);
+  return overlay;
+}
+
+function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
+  const overlay = createOverlay();
+  const dialog = document.createElement('div');
+  dialog.className = 'modal-card manager-card big-account-card';
+  dialog.innerHTML = `
+    <div class="dialog-header">
+      <div class="dialog-title">维护大账号</div>
+      <button class="icon-close" type="button">×</button>
+    </div>
+    <div class="table-wrapper">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>大账号</th>
+            <th>币种</th>
+            <th class="manager-action-header">执行操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="dialog-actions split">
+      <button class="secondary-btn small" type="button" data-action="add">新增</button>
+      <button class="primary-btn small" type="button" data-action="done">完成</button>
+    </div>
+  `;
+
+  const tbody = dialog.querySelector('tbody');
+  const currencySelectOptions = [
+    '<option value=""></option>',
+    ...state.currencyOptions.map((currencyCode) => `<option value="${escapeHtml(currencyCode)}">${escapeHtml(currencyCode)}</option>`)
+  ].join('');
+
+  function updateCurrencyDropdownLabel(button, currencies) {
+    const selectedCurrencies = Array.from(new Set((currencies || []).filter((value) => value)));
+    button.textContent = formatSelectedCurrencySummary(selectedCurrencies);
+    button.title = selectedCurrencies.join('、');
+    button.disabled = state.currencyOptions.length === 0;
+  }
+
+  function renderCurrencyDropdownOptions(panel, selectedCurrencies) {
+    panel.replaceChildren();
+
+    if (!state.currencyOptions.length) {
+      const emptyState = document.createElement('div');
+      emptyState.className = 'new-account-currency-option';
+      emptyState.innerHTML = '<span class="new-account-currency-option-text">未读取到币种选项</span>';
+      panel.appendChild(emptyState);
+      return;
+    }
+
+    state.currencyOptions.forEach((currencyCode) => {
+      const option = document.createElement('label');
+      option.className = 'new-account-currency-option';
+
+      const text = document.createElement('span');
+      text.className = 'new-account-currency-option-text';
+      text.textContent = currencyCode;
+
+      const checkbox = document.createElement('input');
+      checkbox.className = 'new-account-checkbox';
+      checkbox.type = 'checkbox';
+      checkbox.value = currencyCode;
+      checkbox.checked = selectedCurrencies.includes(currencyCode);
+
+      option.append(text, checkbox);
+      panel.appendChild(option);
+    });
+  }
+
+  function createBigAccountRow(item = {}) {
+    const row = document.createElement('tr');
+    row.dataset.bigAccountRow = 'true';
+    row.innerHTML = `
+      <td><input class="mapping-text-input big-account-merchant-input" type="text" spellcheck="false" value="${escapeHtml(item.merchantId || '')}" /></td>
+      <td>
+        <div class="big-account-currency-editor">
+          <select class="mapping-select big-account-currency-select">${currencySelectOptions}</select>
+          <div class="new-account-currency-dropdown-wrap big-account-currency-dropdown-wrap" hidden>
+            <button class="new-account-input new-account-currency-dropdown-btn big-account-currency-dropdown-btn" type="button" aria-expanded="false"></button>
+            <div class="new-account-currency-dropdown-panel big-account-currency-dropdown-panel" hidden></div>
+          </div>
+          <label class="new-account-checkbox-label big-account-multi-label">
+            <input class="new-account-checkbox big-account-multi-checkbox" type="checkbox" />
+            <span>多币种</span>
+          </label>
+        </div>
+      </td>
+      <td class="action-cell manager-action-cell">
+        <button class="text-action danger" type="button" data-action="delete">删除</button>
+      </td>
+    `;
+
+    const select = row.querySelector('.big-account-currency-select');
+    const dropdownWrap = row.querySelector('.big-account-currency-dropdown-wrap');
+    const dropdownButton = row.querySelector('.big-account-currency-dropdown-btn');
+    const dropdownPanel = row.querySelector('.big-account-currency-dropdown-panel');
+    const multiCheckbox = row.querySelector('.big-account-multi-checkbox');
+    let selectedCurrencies = Array.isArray(item.currencies) ? item.currencies.slice() : [];
+
+    multiCheckbox.checked = Boolean(item.isMultiCurrency);
+    if (!multiCheckbox.checked) {
+      select.value = selectedCurrencies[0] || '';
+    }
+
+    function syncCurrencyMode() {
+      const isMultiCurrency = multiCheckbox.checked;
+      select.hidden = isMultiCurrency;
+      dropdownWrap.hidden = !isMultiCurrency;
+
+      if (!isMultiCurrency) {
+        dropdownPanel.hidden = true;
+        dropdownButton.classList.remove('is-open');
+        dropdownButton.setAttribute('aria-expanded', 'false');
+        return;
+      }
+
+      renderCurrencyDropdownOptions(dropdownPanel, selectedCurrencies);
+      dropdownPanel.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
+        checkbox.addEventListener('change', () => {
+          selectedCurrencies = Array.from(
+            dropdownPanel.querySelectorAll('input[type="checkbox"]:checked')
+          ).map((selectedCheckbox) => selectedCheckbox.value);
+          updateCurrencyDropdownLabel(dropdownButton, selectedCurrencies);
+        });
+      });
+      updateCurrencyDropdownLabel(dropdownButton, selectedCurrencies);
+    }
+
+    dropdownButton.addEventListener('click', () => {
+      if (dropdownWrap.hidden) {
+        return;
+      }
+
+      const nextHidden = !dropdownPanel.hidden;
+      dropdownPanel.hidden = nextHidden;
+      dropdownButton.classList.toggle('is-open', !nextHidden);
+      dropdownButton.setAttribute('aria-expanded', nextHidden ? 'false' : 'true');
+    });
+    multiCheckbox.addEventListener('change', syncCurrencyMode);
+    row.querySelector('[data-action="delete"]').addEventListener('click', () => {
+      row.remove();
+    });
+    syncCurrencyMode();
+    return row;
+  }
+
+  const initialBigAccounts = bigAccounts.length
+    ? bigAccounts
+    : [{ merchantId: '', currencies: [], isMultiCurrency: false }];
+  initialBigAccounts.forEach((item) => {
+    tbody.appendChild(createBigAccountRow(item));
+  });
+
+  dialog.querySelector('.icon-close').addEventListener('click', onCancel);
+  dialog.querySelector('[data-action="add"]').addEventListener('click', () => {
+    tbody.appendChild(createBigAccountRow());
+  });
+  dialog.querySelector('[data-action="done"]').addEventListener('click', () => {
+    const nextBigAccounts = Array.from(tbody.querySelectorAll('tr[data-big-account-row]')).map((row) => {
+      const merchantId = row.querySelector('.big-account-merchant-input').value;
+      const isMultiCurrency = row.querySelector('.big-account-multi-checkbox').checked;
+      const currencies = isMultiCurrency
+        ? Array.from(row.querySelectorAll('.big-account-currency-dropdown-panel input[type="checkbox"]:checked')).map((checkbox) => checkbox.value)
+        : [row.querySelector('.big-account-currency-select').value].filter((value) => value !== '');
+
+      return {
+        merchantId,
+        currencies,
+        isMultiCurrency
+      };
+    }).filter((item) => item.merchantId.trim() !== '' || item.currencies.length > 0);
+
+    onDone(nextBigAccounts);
+  });
+
+  overlay.appendChild(dialog);
+  return overlay;
+}
+
 function renderTemplateTableRows(tableBody) {
   tableBody.innerHTML = '';
 
@@ -932,6 +1246,7 @@ function renderTemplateTableRows(tableBody) {
     const emptyRow = document.createElement('tr');
     emptyRow.innerHTML = `
       <td class="empty-cell">暂无模板</td>
+      <td class="empty-cell">-</td>
       <td class="empty-cell">-</td>
     `;
     tableBody.appendChild(emptyRow);
@@ -942,8 +1257,10 @@ function renderTemplateTableRows(tableBody) {
     const row = document.createElement('tr');
     row.innerHTML = `
       <td>${template.name}</td>
-      <td class="action-cell">
+      <td>${template.bigAccountSummary || '未设置'}</td>
+      <td class="action-cell manager-action-cell">
         <button class="text-action" type="button" data-action="manage">修改</button>
+        <button class="text-action" type="button" data-action="rename">重命名</button>
         <button class="text-action danger" type="button" data-action="delete">删除</button>
       </td>
     `;
@@ -961,7 +1278,9 @@ function renderTemplateTableRows(tableBody) {
 
       openModal(createMappingDialog(result));
     });
-
+    row.querySelector('[data-action="rename"]').addEventListener('click', () => {
+      openModal(createTemplateRenameDialog(template));
+    });
     row.querySelector('[data-action="delete"]').addEventListener('click', () => {
       openModal(
         createConfirmDialog({
@@ -994,15 +1313,54 @@ function createTemplateManagerDialog() {
         <thead>
           <tr>
             <th>模板名称</th>
-            <th>执行操作</th>
+            <th>大账号</th>
+            <th class="manager-action-header">执行操作</th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
+    <div class="dialog-actions split">
+      <button class="secondary-btn small" type="button" data-action="import-bundle">导入模板文件</button>
+      <button class="secondary-btn small" type="button" data-action="export-bundle">导出模板文件</button>
+    </div>
   `;
 
   dialog.querySelector('.icon-close').addEventListener('click', closeModal);
+  dialog.querySelector('[data-action="import-bundle"]').addEventListener('click', async () => {
+    const result = await window.desktopApi.templates.importBundle();
+
+    if (result.status === 'cancelled') {
+      return;
+    }
+
+    setStatus(result.message, result.status === 'success' ? 'success' : 'error', {
+      errorReportReady: Boolean(result.errorReportReady)
+    });
+
+    if (result.status === 'success') {
+      await refreshTemplates();
+      openModal(createTemplateManagerDialog());
+      return;
+    }
+
+    openModal(createAlertDialog(result.message));
+  });
+  dialog.querySelector('[data-action="export-bundle"]').addEventListener('click', async () => {
+    const result = await window.desktopApi.templates.exportBundle();
+
+    if (result.status === 'cancelled') {
+      return;
+    }
+
+    setStatus(result.message, result.status === 'success' ? 'success' : 'error', {
+      errorReportReady: Boolean(result.errorReportReady)
+    });
+
+    if (result.status !== 'success') {
+      openModal(createAlertDialog(result.message));
+    }
+  });
   renderTemplateTableRows(dialog.querySelector('tbody'));
   overlay.appendChild(dialog);
   return overlay;
@@ -1014,6 +1372,7 @@ function createMappingDialog(payload) {
   const advancedMappingFields = Array.isArray(payload.advancedMappingFields) && payload.advancedMappingFields.length
     ? payload.advancedMappingFields
     : ADVANCED_MAPPING_FIELDS;
+  const currentBigAccounts = cloneBigAccountItems(payload.bigAccounts || []);
   dialog.className = 'modal-card mapping-card';
   dialog.innerHTML = `
     <div class="dialog-header">
@@ -1060,7 +1419,8 @@ function createMappingDialog(payload) {
     const supportsCustomInput = isMerchantIdField || isCurrencyField;
     const savedMapping = savedMap.get(fieldName) || {
       mappedField: isBalanceField ? BALANCE_DISABLED_OPTION : '',
-      customValue: ''
+      customValue: '',
+      isMultiBigAccount: false
     };
     const selectOptions = [isBalanceField ? `<option value="${BALANCE_DISABLED_OPTION}">${BALANCE_DISABLED_OPTION}</option>` : '<option value=""></option>']
       .concat(isBalanceField ? [`<option value="${BALANCE_CALCULATED_OPTION}">${BALANCE_CALCULATED_OPTION}</option>`] : [])
@@ -1072,23 +1432,81 @@ function createMappingDialog(payload) {
       <td>
         <div class="mapping-field-editor">
           <select class="mapping-select">${selectOptions}</select>
-          ${supportsCustomInput ? `<input class="mapping-text-input mapping-custom-input" type="text" spellcheck="false" placeholder="${isMerchantIdField ? '请输入固定 MerchantId' : '请输入固定 Currency'}" />` : ''}
+          ${supportsCustomInput ? `<input class="mapping-text-input mapping-custom-input mapping-custom-input-compact" type="text" spellcheck="false" placeholder="${isMerchantIdField ? '请输入固定 MerchantId' : '请输入固定 Currency'}" />` : ''}
+          ${isMerchantIdField ? `
+            <label class="new-account-checkbox-label mapping-big-account-label" hidden>
+              <input class="new-account-checkbox mapping-big-account-toggle" type="checkbox" />
+              <span class="mapping-big-account-label-text">模板里存在多个大账号</span>
+            </label>
+            <button class="secondary-btn small mapping-big-account-manage-btn" type="button" hidden>维护大账号</button>
+          ` : ''}
         </div>
       </td>
     `;
 
-    const select = row.querySelector('select');
+    const select = row.querySelector('.mapping-select');
     const customInput = row.querySelector('.mapping-custom-input');
+    const bigAccountLabel = row.querySelector('.mapping-big-account-label');
+    const bigAccountToggle = row.querySelector('.mapping-big-account-toggle');
+    const manageBigAccountBtn = row.querySelector('.mapping-big-account-manage-btn');
     select.value = savedMapping.mappedField || (isBalanceField ? BALANCE_DISABLED_OPTION : '');
+
+    function syncEditorState() {
+      const isCustomInput = select.value === MERCHANT_ID_SELF_INPUT_OPTION;
+      const isMultiBigAccount = Boolean(bigAccountToggle?.checked);
+
+      if (customInput) {
+        customInput.hidden = !isCustomInput || (isMerchantIdField && isMultiBigAccount);
+      }
+
+      if (bigAccountLabel) {
+        bigAccountLabel.hidden = !isCustomInput;
+      }
+
+      if (manageBigAccountBtn) {
+        manageBigAccountBtn.hidden = !isCustomInput || !isMultiBigAccount;
+      }
+    }
 
     if (customInput) {
       customInput.value = savedMapping.customValue || '';
-      customInput.hidden = select.value !== MERCHANT_ID_SELF_INPUT_OPTION;
-      select.addEventListener('change', () => {
-        customInput.hidden = select.value !== MERCHANT_ID_SELF_INPUT_OPTION;
+    }
+
+    if (bigAccountToggle) {
+      bigAccountToggle.checked = Boolean(savedMapping.isMultiBigAccount);
+      bigAccountToggle.addEventListener('change', syncEditorState);
+    }
+
+    if (manageBigAccountBtn) {
+      manageBigAccountBtn.addEventListener('click', () => {
+        const draftMappings = collectMappingDraftFromTable(tbody);
+        openModal(createBigAccountManagerDialog({
+          bigAccounts: currentBigAccounts,
+          onDone: (nextBigAccounts) => {
+            const nextMappings = draftMappings.map((mapping) => {
+              return mapping.templateField === 'MerchantId'
+                ? { ...mapping, isMultiBigAccount: true }
+                : mapping;
+            });
+            openModal(createMappingDialog({
+              ...payload,
+              mappings: nextMappings,
+              bigAccounts: nextBigAccounts
+            }));
+          },
+          onCancel: () => {
+            openModal(createMappingDialog({
+              ...payload,
+              mappings: draftMappings,
+              bigAccounts: currentBigAccounts
+            }));
+          }
+        }));
       });
     }
 
+    select.addEventListener('change', syncEditorState);
+    syncEditorState();
     tbody.appendChild(row);
   });
 
@@ -1097,29 +1515,24 @@ function createMappingDialog(payload) {
   });
 
   dialog.querySelector('[data-action="done"]').addEventListener('click', async () => {
-    const mappings = Array.from(tbody.querySelectorAll('tr[data-template-field]')).map((row) => {
-      const select = row.querySelector('.mapping-select');
-      const customInput = row.querySelector('.mapping-custom-input');
-
-      return {
-      templateField: row.dataset.templateField,
-      mappedField: select.value,
-      customValue: customInput ? customInput.value : ''
-      };
-    });
+    const mappings = collectMappingDraftFromTable(tbody);
     const result = await window.desktopApi.templates.saveMappings({
       templateId: payload.template.id,
-      mappings
+      mappings,
+      bigAccounts: currentBigAccounts
     });
 
-    openModal(createAlertDialog(result.message));
     setStatus(result.message, result.status === 'success' ? 'success' : 'error', {
       errorReportReady: Boolean(result.errorReportReady)
     });
 
     if (result.status === 'success') {
       await refreshTemplates();
+      openModal(createTemplateManagerDialog());
+      return;
     }
+
+    openModal(createAlertDialog(result.message));
   });
 
   overlay.appendChild(dialog);
@@ -1279,6 +1692,11 @@ async function handleImportFile() {
     return;
   }
 
+  if (result.status === 'select-big-account') {
+    openModal(createBigAccountSelectionDialog(result.options || []));
+    return;
+  }
+
   applyStatementResult(result);
 }
 
@@ -1341,14 +1759,158 @@ function applyTemplateManagerPreviewState() {
   state.templates = [
     {
       id: 'preview-template-1',
-      name: 'LusoBank-MO'
+      name: 'LusoBank-MO',
+      bigAccountSummary: '来自账单'
     },
     {
       id: 'preview-template-2',
-      name: 'BankABC-HK'
+      name: 'BankABC-HK',
+      bigAccountSummary: '未设置'
+    },
+    {
+      id: 'preview-template-3',
+      name: 'PingPong-US',
+      bigAccountSummary: '1个'
+    },
+    {
+      id: 'preview-template-4',
+      name: 'HSBC-SG',
+      bigAccountSummary: '3个'
     }
   ];
   openModal(createTemplateManagerDialog());
+}
+
+function buildPreviewMappingPayload() {
+  return {
+    template: {
+      id: 'preview-template-4',
+      name: 'HSBC-SG',
+      headers: [
+        '交易日期',
+        '起息日期',
+        '发生额',
+        '余额',
+        '对手户名',
+        '对手账号',
+        '币种',
+        '附言'
+      ]
+    },
+    targetFields: [
+      'BillDate',
+      'ValueDate',
+      'Credit Amount',
+      'Debit Amount',
+      'Balance',
+      'MerchantId',
+      'Currency',
+      'Payee Name',
+      'Payee Cardno',
+      'Drawee Name',
+      'Drawee CardNo',
+      SIGNED_AMOUNT_MAPPING_FIELD,
+      AMOUNT_BASED_NAME_MAPPING_FIELD,
+      AMOUNT_BASED_ACCOUNT_MAPPING_FIELD
+    ],
+    mappings: [
+      { templateField: 'BillDate', mappedField: '交易日期', customValue: '', isMultiBigAccount: false },
+      { templateField: 'ValueDate', mappedField: '起息日期', customValue: '', isMultiBigAccount: false },
+      { templateField: 'Credit Amount', mappedField: '', customValue: '', isMultiBigAccount: false },
+      { templateField: 'Debit Amount', mappedField: '', customValue: '', isMultiBigAccount: false },
+      { templateField: 'Balance', mappedField: BALANCE_CALCULATED_OPTION, customValue: '', isMultiBigAccount: false },
+      { templateField: 'MerchantId', mappedField: MERCHANT_ID_SELF_INPUT_OPTION, customValue: '', isMultiBigAccount: true },
+      { templateField: 'Currency', mappedField: MERCHANT_ID_SELF_INPUT_OPTION, customValue: 'USD', isMultiBigAccount: false },
+      { templateField: 'Payee Name', mappedField: '', customValue: '', isMultiBigAccount: false },
+      { templateField: 'Payee Cardno', mappedField: '', customValue: '', isMultiBigAccount: false },
+      { templateField: 'Drawee Name', mappedField: '', customValue: '', isMultiBigAccount: false },
+      { templateField: 'Drawee CardNo', mappedField: '', customValue: '', isMultiBigAccount: false },
+      { templateField: SIGNED_AMOUNT_MAPPING_FIELD, mappedField: '发生额', customValue: '', isMultiBigAccount: false },
+      { templateField: AMOUNT_BASED_NAME_MAPPING_FIELD, mappedField: '对手户名', customValue: '', isMultiBigAccount: false },
+      { templateField: AMOUNT_BASED_ACCOUNT_MAPPING_FIELD, mappedField: '对手账号', customValue: '', isMultiBigAccount: false }
+    ],
+    bigAccounts: [
+      {
+        merchantId: '6222000000000001',
+        currencies: ['USD'],
+        isMultiBigAccount: false
+      },
+      {
+        merchantId: '6222000000000001',
+        currencies: ['HKD', 'CNY', 'EUR'],
+        isMultiBigAccount: true
+      }
+    ],
+    advancedMappingFields: ADVANCED_MAPPING_FIELDS.slice()
+  };
+}
+
+function applyMappingDialogPreviewState() {
+  setCurrentModule(MODULES.statementGenerator.id);
+  state.currencyOptions = ['USD', 'HKD', 'CNY', 'EUR', 'JPY'];
+  openModal(createMappingDialog(buildPreviewMappingPayload()));
+}
+
+function applyTemplateRenamePreviewState() {
+  setCurrentModule(MODULES.statementGenerator.id);
+  openModal(createTemplateRenameDialog({
+    id: 'preview-template-2',
+    name: 'BankABC-HK'
+  }));
+}
+
+function applyBigAccountManagerPreviewState() {
+  setCurrentModule(MODULES.statementGenerator.id);
+  state.currencyOptions = ['USD', 'HKD', 'CNY', 'EUR', 'JPY'];
+  openModal(createBigAccountManagerDialog({
+    bigAccounts: [
+      {
+        merchantId: '6222000000000001',
+        currencies: ['USD'],
+        isMultiCurrency: false
+      },
+      {
+        merchantId: '6222000000000001',
+        currencies: ['HKD', 'CNY', 'EUR', 'JPY'],
+        isMultiCurrency: true
+      },
+      {
+        merchantId: '9558800000000008',
+        currencies: ['SGD', 'USD'],
+        isMultiCurrency: true
+      }
+    ],
+    onDone: () => {},
+    onCancel: closeModal
+  }));
+}
+
+function applyBigAccountSelectionPreviewState() {
+  setCurrentModule(MODULES.statementGenerator.id);
+  openModal(createBigAccountSelectionDialog([
+    {
+      label: '6222000000000001 / USD',
+      merchantId: '6222000000000001',
+      currency: 'USD'
+    },
+    {
+      label: '6222000000000001 / HKD',
+      merchantId: '6222000000000001',
+      currency: 'HKD'
+    },
+    {
+      label: '9558800000000008 / SGD',
+      merchantId: '9558800000000008',
+      currency: 'SGD'
+    }
+  ]));
+
+  setTimeout(() => {
+    const firstOption = elements.modalRoot.querySelector('.big-account-selection-list input[type="radio"]');
+    if (firstOption) {
+      firstOption.checked = true;
+    }
+  }, 40);
 }
 
 async function handleNewAccountGenerate() {
@@ -1605,6 +2167,22 @@ async function initialize() {
   } else if (info.previewModal === 'template-manager') {
     setTimeout(() => {
       applyTemplateManagerPreviewState();
+    }, 120);
+  } else if (info.previewModal === 'mapping-dialog') {
+    setTimeout(() => {
+      applyMappingDialogPreviewState();
+    }, 120);
+  } else if (info.previewModal === 'template-rename') {
+    setTimeout(() => {
+      applyTemplateRenamePreviewState();
+    }, 120);
+  } else if (info.previewModal === 'big-account-manager') {
+    setTimeout(() => {
+      applyBigAccountManagerPreviewState();
+    }, 120);
+  } else if (info.previewModal === 'big-account-selection') {
+    setTimeout(() => {
+      applyBigAccountSelectionPreviewState();
     }, 120);
   } else if (info.previewModal === 'new-account') {
     setTimeout(() => {
