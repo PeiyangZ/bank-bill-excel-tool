@@ -397,6 +397,7 @@ select {
 .new-account-label {
   font-size: 14px;
   color: var(--muted);
+  padding-left: 1em;
 }
 
 .new-account-input {
@@ -886,13 +887,40 @@ select {
   align-items: center;
 }
 
-.manager-action-header,
-.manager-action-cell {
-  padding-right: 1cm;
+.manager-action-header {
+  width: 228px;
 }
 
 .manager-action-cell {
-  justify-content: flex-end;
+  width: 228px;
+}
+
+.manager-action-header-label {
+  display: block;
+  width: 166px;
+  margin: 0 auto;
+  text-align: left;
+}
+
+.manager-row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 16px;
+  width: 166px;
+  margin: 0 auto;
+}
+
+.manager-big-account-cell {
+  max-width: 250px;
+}
+
+.manager-big-account-summary {
+  display: block;
+  max-width: 250px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .add-row td {
@@ -942,6 +970,10 @@ select {
   margin-top: 18px;
 }
 
+.template-manager-bundle-actions {
+  margin-top: 18px;
+}
+
 .mapping-big-account-label {
   white-space: nowrap;
 }
@@ -959,11 +991,16 @@ select {
   width: min(100%, 980px);
 }
 
+.big-account-footer-actions {
+  margin-top: 18px;
+}
+
 .big-account-currency-editor {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+  min-height: 44px;
 }
 
 .big-account-currency-select {
@@ -979,12 +1016,13 @@ select {
   width: 100%;
 }
 
-.big-account-currency-dropdown-panel {
-  min-width: 100%;
+.big-account-currency-floating-panel {
+  z-index: 32;
 }
 
 .big-account-multi-label {
   color: var(--muted);
+  white-space: nowrap;
 }
 
 .big-account-selection-list {
@@ -1001,6 +1039,29 @@ select {
   border: 1px solid rgba(104, 79, 39, 0.12);
   border-radius: 12px;
   background: rgba(255, 250, 241, 0.7);
+}
+
+.big-account-action-cell {
+  vertical-align: middle;
+}
+
+.big-account-row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 18px;
+  min-height: 44px;
+  width: 166px;
+  margin: 0 auto;
+}
+
+.big-account-view-text {
+  display: block;
+  min-height: 44px;
+  line-height: 44px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 @media (max-width: 1080px) {

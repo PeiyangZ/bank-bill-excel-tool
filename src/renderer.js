@@ -938,6 +938,28 @@ function cloneBigAccountItems(bigAccounts = []) {
   }));
 }
 
+function formatBigAccountCurrencySummary(currencies) {
+  const uniqueCurrencies = Array.from(new Set((currencies || []).filter((value) => value)));
+
+  if (!uniqueCurrencies.length) {
+    return '';
+  }
+
+  if (uniqueCurrencies.length === 1) {
+    return uniqueCurrencies[0];
+  }
+
+  if (uniqueCurrencies.length <= 3) {
+    return uniqueCurrencies.join('、');
+  }
+
+  return `${uniqueCurrencies.length}个币种`;
+}
+
+function getBigAccountCurrencyTitle(currencies) {
+  return Array.from(new Set((currencies || []).filter((value) => value))).join('、');
+}
+
 function collectMappingDraftFromTable(tableBody) {
   return Array.from(tableBody.querySelectorAll('tr[data-template-field]')).map((row) => {
     const select = row.querySelector('.mapping-select');
@@ -1074,39 +1096,54 @@ function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
           <tr>
             <th>大账号</th>
             <th>币种</th>
-            <th class="manager-action-header">执行操作</th>
+            <th class="manager-action-header"><span class="manager-action-header-label">执行操作</span></th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
-    <div class="dialog-actions split">
+    <div class="dialog-actions split big-account-footer-actions">
       <button class="secondary-btn small" type="button" data-action="add">新增</button>
       <button class="primary-btn small" type="button" data-action="done">完成</button>
     </div>
   `;
 
   const tbody = dialog.querySelector('tbody');
+  const tableWrapper = dialog.querySelector('.table-wrapper');
+  const floatingPanel = document.createElement('div');
+  floatingPanel.className = 'new-account-currency-dropdown-panel big-account-currency-floating-panel';
+  floatingPanel.hidden = true;
   const currencySelectOptions = [
     '<option value=""></option>',
     ...state.currencyOptions.map((currencyCode) => `<option value="${escapeHtml(currencyCode)}">${escapeHtml(currencyCode)}</option>`)
   ].join('');
+  let activeFloatingDropdown = null;
+
+  function cleanupFloatingDropdown() {
+    if (activeFloatingDropdown?.button) {
+      activeFloatingDropdown.button.classList.remove('is-open');
+      activeFloatingDropdown.button.setAttribute('aria-expanded', 'false');
+    }
+
+    activeFloatingDropdown = null;
+    floatingPanel.hidden = true;
+    floatingPanel.replaceChildren();
+  }
 
   function updateCurrencyDropdownLabel(button, currencies) {
     const selectedCurrencies = Array.from(new Set((currencies || []).filter((value) => value)));
-    button.textContent = formatSelectedCurrencySummary(selectedCurrencies);
-    button.title = selectedCurrencies.join('、');
+    button.textContent = formatBigAccountCurrencySummary(selectedCurrencies) || '\u00A0';
+    button.title = getBigAccountCurrencyTitle(selectedCurrencies);
     button.disabled = state.currencyOptions.length === 0;
   }
 
-  function renderCurrencyDropdownOptions(panel, selectedCurrencies) {
-    panel.replaceChildren();
-
+  function renderCurrencyDropdownOptions(selectedCurrencies, onChange) {
+    floatingPanel.replaceChildren();
     if (!state.currencyOptions.length) {
       const emptyState = document.createElement('div');
       emptyState.className = 'new-account-currency-option';
       emptyState.innerHTML = '<span class="new-account-currency-option-text">未读取到币种选项</span>';
-      panel.appendChild(emptyState);
+      floatingPanel.appendChild(emptyState);
       return;
     }
 
@@ -1123,45 +1160,126 @@ function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
       checkbox.type = 'checkbox';
       checkbox.value = currencyCode;
       checkbox.checked = selectedCurrencies.includes(currencyCode);
+      checkbox.addEventListener('change', () => {
+        onChange(
+          Array.from(floatingPanel.querySelectorAll('input[type="checkbox"]:checked')).map((selectedCheckbox) => selectedCheckbox.value)
+        );
+      });
 
       option.append(text, checkbox);
-      panel.appendChild(option);
+      floatingPanel.appendChild(option);
     });
   }
 
-  function createBigAccountRow(item = {}) {
+  function positionFloatingDropdown(button) {
+    const buttonRect = button.getBoundingClientRect();
+    const margin = 12;
+    const availableWidth = Math.max(220, Math.min(260, window.innerWidth - margin * 2));
+
+    floatingPanel.style.position = 'fixed';
+    floatingPanel.style.minWidth = `${Math.max(buttonRect.width, 188)}px`;
+    floatingPanel.style.maxWidth = `${availableWidth}px`;
+    floatingPanel.style.visibility = 'hidden';
+    floatingPanel.hidden = false;
+
+    const panelWidth = floatingPanel.offsetWidth || Math.max(buttonRect.width, 188);
+    const panelHeight = floatingPanel.offsetHeight || 216;
+    const left = Math.min(
+      Math.max(margin, buttonRect.left),
+      Math.max(margin, window.innerWidth - panelWidth - margin)
+    );
+    const top = buttonRect.bottom + 6 + panelHeight > window.innerHeight - margin
+      ? Math.max(margin, buttonRect.top - panelHeight - 6)
+      : buttonRect.bottom + 6;
+
+    floatingPanel.style.left = `${left}px`;
+    floatingPanel.style.top = `${top}px`;
+    floatingPanel.style.visibility = 'visible';
+  }
+
+  function openFloatingDropdown({ button, selectedCurrencies, onChange }) {
+    const sameButton = activeFloatingDropdown?.button === button;
+    cleanupFloatingDropdown();
+
+    if (sameButton) {
+      return;
+    }
+
+    renderCurrencyDropdownOptions(selectedCurrencies, onChange);
+    activeFloatingDropdown = { button };
+    button.classList.add('is-open');
+    button.setAttribute('aria-expanded', 'true');
+    positionFloatingDropdown(button);
+  }
+
+  function createBigAccountRow(item = {}, initialMode = 'view') {
     const row = document.createElement('tr');
     row.dataset.bigAccountRow = 'true';
+    row.dataset.mode = initialMode;
     row.innerHTML = `
-      <td><input class="mapping-text-input big-account-merchant-input" type="text" spellcheck="false" value="${escapeHtml(item.merchantId || '')}" /></td>
+      <td>
+        <input class="mapping-text-input big-account-merchant-input" type="text" spellcheck="false" value="${escapeHtml(item.merchantId || '')}" />
+        <span class="big-account-view-text big-account-merchant-view" hidden></span>
+      </td>
       <td>
         <div class="big-account-currency-editor">
           <select class="mapping-select big-account-currency-select">${currencySelectOptions}</select>
           <div class="new-account-currency-dropdown-wrap big-account-currency-dropdown-wrap" hidden>
             <button class="new-account-input new-account-currency-dropdown-btn big-account-currency-dropdown-btn" type="button" aria-expanded="false"></button>
-            <div class="new-account-currency-dropdown-panel big-account-currency-dropdown-panel" hidden></div>
           </div>
           <label class="new-account-checkbox-label big-account-multi-label">
             <input class="new-account-checkbox big-account-multi-checkbox" type="checkbox" />
             <span>多币种</span>
           </label>
         </div>
+        <span class="big-account-view-text big-account-currency-view" hidden></span>
       </td>
-      <td class="action-cell manager-action-cell">
-        <button class="text-action danger" type="button" data-action="delete">删除</button>
+      <td class="manager-action-cell big-account-action-cell">
+        <div class="big-account-row-actions">
+          <button class="text-action" type="button" data-action="toggle-complete"></button>
+          <button class="text-action danger" type="button" data-action="delete">删除</button>
+        </div>
       </td>
     `;
 
+    const merchantInput = row.querySelector('.big-account-merchant-input');
+    const merchantView = row.querySelector('.big-account-merchant-view');
     const select = row.querySelector('.big-account-currency-select');
     const dropdownWrap = row.querySelector('.big-account-currency-dropdown-wrap');
     const dropdownButton = row.querySelector('.big-account-currency-dropdown-btn');
-    const dropdownPanel = row.querySelector('.big-account-currency-dropdown-panel');
     const multiCheckbox = row.querySelector('.big-account-multi-checkbox');
+    const currencyEditor = row.querySelector('.big-account-currency-editor');
+    const currencyView = row.querySelector('.big-account-currency-view');
+    const toggleCompleteBtn = row.querySelector('[data-action="toggle-complete"]');
     let selectedCurrencies = Array.isArray(item.currencies) ? item.currencies.slice() : [];
 
     multiCheckbox.checked = Boolean(item.isMultiCurrency);
     if (!multiCheckbox.checked) {
       select.value = selectedCurrencies[0] || '';
+    }
+
+    function getRowDraft() {
+      return {
+        merchantId: merchantInput.value.trim(),
+        isMultiCurrency: multiCheckbox.checked,
+        currencies: multiCheckbox.checked
+          ? Array.from(new Set(selectedCurrencies.filter((value) => value)))
+          : [select.value].filter((value) => value !== '')
+      };
+    }
+
+    function validateRowDraft() {
+      const draft = getRowDraft();
+
+      if (!draft.merchantId) {
+        return '请填写大账号';
+      }
+
+      if (!draft.currencies.length) {
+        return '请选择币种';
+      }
+
+      return '';
     }
 
     function syncCurrencyMode() {
@@ -1170,21 +1288,12 @@ function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
       dropdownWrap.hidden = !isMultiCurrency;
 
       if (!isMultiCurrency) {
-        dropdownPanel.hidden = true;
-        dropdownButton.classList.remove('is-open');
-        dropdownButton.setAttribute('aria-expanded', 'false');
+        if (activeFloatingDropdown?.button === dropdownButton) {
+          cleanupFloatingDropdown();
+        }
         return;
       }
 
-      renderCurrencyDropdownOptions(dropdownPanel, selectedCurrencies);
-      dropdownPanel.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
-        checkbox.addEventListener('change', () => {
-          selectedCurrencies = Array.from(
-            dropdownPanel.querySelectorAll('input[type="checkbox"]:checked')
-          ).map((selectedCheckbox) => selectedCheckbox.value);
-          updateCurrencyDropdownLabel(dropdownButton, selectedCurrencies);
-        });
-      });
       updateCurrencyDropdownLabel(dropdownButton, selectedCurrencies);
     }
 
@@ -1193,16 +1302,94 @@ function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
         return;
       }
 
-      const nextHidden = !dropdownPanel.hidden;
-      dropdownPanel.hidden = nextHidden;
-      dropdownButton.classList.toggle('is-open', !nextHidden);
-      dropdownButton.setAttribute('aria-expanded', nextHidden ? 'false' : 'true');
+      openFloatingDropdown({
+        button: dropdownButton,
+        selectedCurrencies,
+        onChange: (nextSelectedCurrencies) => {
+          selectedCurrencies = nextSelectedCurrencies;
+          updateCurrencyDropdownLabel(dropdownButton, selectedCurrencies);
+        }
+      });
     });
     multiCheckbox.addEventListener('change', syncCurrencyMode);
+    select.addEventListener('change', () => {
+      if (row.dataset.mode === 'view') {
+        return;
+      }
+
+      currencyView.textContent = select.value;
+      currencyView.title = select.value;
+    });
+    merchantInput.addEventListener('input', () => {
+      if (row.dataset.mode === 'view') {
+        return;
+      }
+
+      merchantView.textContent = merchantInput.value.trim();
+      merchantView.title = merchantInput.value.trim();
+    });
+    toggleCompleteBtn.addEventListener('click', () => {
+      if (row.dataset.mode === 'edit') {
+        const validationMessage = validateRowDraft();
+
+        if (validationMessage) {
+          setStatus(validationMessage, 'error');
+          return;
+        }
+
+        const draft = getRowDraft();
+        merchantView.textContent = draft.merchantId;
+        merchantView.title = draft.merchantId;
+        currencyView.textContent = formatBigAccountCurrencySummary(draft.currencies);
+        currencyView.title = getBigAccountCurrencyTitle(draft.currencies);
+        merchantInput.hidden = true;
+        currencyEditor.hidden = true;
+        merchantView.hidden = false;
+        currencyView.hidden = false;
+        row.dataset.mode = 'view';
+        toggleCompleteBtn.textContent = '修改';
+        if (activeFloatingDropdown?.button === dropdownButton) {
+          cleanupFloatingDropdown();
+        }
+        return;
+      }
+
+      row.dataset.mode = 'edit';
+      merchantInput.hidden = false;
+      currencyEditor.hidden = false;
+      merchantView.hidden = true;
+      currencyView.hidden = true;
+      toggleCompleteBtn.textContent = '完成';
+      syncCurrencyMode();
+    });
     row.querySelector('[data-action="delete"]').addEventListener('click', () => {
+      if (activeFloatingDropdown?.button === dropdownButton) {
+        cleanupFloatingDropdown();
+      }
       row.remove();
     });
+
     syncCurrencyMode();
+
+    if (initialMode === 'view') {
+      const initialDraft = getRowDraft();
+      merchantView.textContent = initialDraft.merchantId;
+      merchantView.title = initialDraft.merchantId;
+      currencyView.textContent = formatBigAccountCurrencySummary(initialDraft.currencies);
+      currencyView.title = getBigAccountCurrencyTitle(initialDraft.currencies);
+      merchantInput.hidden = true;
+      currencyEditor.hidden = true;
+      merchantView.hidden = false;
+      currencyView.hidden = false;
+      toggleCompleteBtn.textContent = '修改';
+    } else {
+      merchantInput.hidden = false;
+      currencyEditor.hidden = false;
+      merchantView.hidden = true;
+      currencyView.hidden = true;
+      toggleCompleteBtn.textContent = '完成';
+    }
+
     return row;
   }
 
@@ -1210,19 +1397,51 @@ function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
     ? bigAccounts
     : [{ merchantId: '', currencies: [], isMultiCurrency: false }];
   initialBigAccounts.forEach((item) => {
-    tbody.appendChild(createBigAccountRow(item));
+    tbody.appendChild(createBigAccountRow(item, bigAccounts.length ? 'view' : 'edit'));
   });
 
-  dialog.querySelector('.icon-close').addEventListener('click', onCancel);
+  const handleKeydown = (event) => {
+    if (event.key === 'Escape' && !floatingPanel.hidden) {
+      cleanupFloatingDropdown();
+    }
+  };
+
+  document.addEventListener('keydown', handleKeydown);
+  overlay.addEventListener('mousedown', (event) => {
+    if (
+      activeFloatingDropdown &&
+      !floatingPanel.contains(event.target) &&
+      !activeFloatingDropdown.button.contains(event.target)
+    ) {
+      cleanupFloatingDropdown();
+    }
+  });
+  tableWrapper.addEventListener('scroll', cleanupFloatingDropdown);
+
+  function cleanupAndCancel() {
+    cleanupFloatingDropdown();
+    document.removeEventListener('keydown', handleKeydown);
+    onCancel();
+  }
+
+  dialog.querySelector('.icon-close').addEventListener('click', cleanupAndCancel);
   dialog.querySelector('[data-action="add"]').addEventListener('click', () => {
-    tbody.appendChild(createBigAccountRow());
+    cleanupFloatingDropdown();
+    tbody.appendChild(createBigAccountRow({}, 'edit'));
   });
   dialog.querySelector('[data-action="done"]').addEventListener('click', () => {
-    const nextBigAccounts = Array.from(tbody.querySelectorAll('tr[data-big-account-row]')).map((row) => {
-      const merchantId = row.querySelector('.big-account-merchant-input').value;
+    const rows = Array.from(tbody.querySelectorAll('tr[data-big-account-row]'));
+
+    if (rows.some((row) => row.dataset.mode === 'edit')) {
+      setStatus('请先完成或删除当前编辑行', 'error');
+      return;
+    }
+
+    const nextBigAccounts = rows.map((row) => {
+      const merchantId = row.querySelector('.big-account-merchant-input').value.trim();
       const isMultiCurrency = row.querySelector('.big-account-multi-checkbox').checked;
       const currencies = isMultiCurrency
-        ? Array.from(row.querySelectorAll('.big-account-currency-dropdown-panel input[type="checkbox"]:checked')).map((checkbox) => checkbox.value)
+        ? Array.from(new Set(row.querySelector('.big-account-currency-view').title.split('、').filter((value) => value)))
         : [row.querySelector('.big-account-currency-select').value].filter((value) => value !== '');
 
       return {
@@ -1230,12 +1449,15 @@ function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
         currencies,
         isMultiCurrency
       };
-    }).filter((item) => item.merchantId.trim() !== '' || item.currencies.length > 0);
+    }).filter((item) => item.merchantId !== '' && item.currencies.length > 0);
 
+    cleanupFloatingDropdown();
+    document.removeEventListener('keydown', handleKeydown);
     onDone(nextBigAccounts);
   });
 
   overlay.appendChild(dialog);
+  overlay.appendChild(floatingPanel);
   return overlay;
 }
 
@@ -1254,14 +1476,19 @@ function renderTemplateTableRows(tableBody) {
   }
 
   state.templates.forEach((template) => {
+    const bigAccountSummary = template.bigAccountSummary || '未设置';
     const row = document.createElement('tr');
     row.innerHTML = `
       <td>${template.name}</td>
-      <td>${template.bigAccountSummary || '未设置'}</td>
-      <td class="action-cell manager-action-cell">
-        <button class="text-action" type="button" data-action="manage">修改</button>
-        <button class="text-action" type="button" data-action="rename">重命名</button>
-        <button class="text-action danger" type="button" data-action="delete">删除</button>
+      <td class="manager-big-account-cell">
+        <span class="manager-big-account-summary" title="${escapeHtml(bigAccountSummary)}">${escapeHtml(bigAccountSummary)}</span>
+      </td>
+      <td class="manager-action-cell">
+        <div class="manager-row-actions">
+          <button class="text-action" type="button" data-action="manage">修改</button>
+          <button class="text-action" type="button" data-action="rename">重命名</button>
+          <button class="text-action danger" type="button" data-action="delete">删除</button>
+        </div>
       </td>
     `;
 
@@ -1314,13 +1541,13 @@ function createTemplateManagerDialog() {
           <tr>
             <th>模板名称</th>
             <th>大账号</th>
-            <th class="manager-action-header">执行操作</th>
+            <th class="manager-action-header"><span class="manager-action-header-label">执行操作</span></th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
-    <div class="dialog-actions split">
+    <div class="dialog-actions right template-manager-bundle-actions">
       <button class="secondary-btn small" type="button" data-action="import-bundle">导入模板文件</button>
       <button class="secondary-btn small" type="button" data-action="export-bundle">导出模板文件</button>
     </div>
@@ -1770,7 +1997,7 @@ function applyTemplateManagerPreviewState() {
     {
       id: 'preview-template-3',
       name: 'PingPong-US',
-      bigAccountSummary: '1个'
+      bigAccountSummary: '62220000000000012345'
     },
     {
       id: 'preview-template-4',
@@ -1883,6 +2110,43 @@ function applyBigAccountManagerPreviewState() {
     onDone: () => {},
     onCancel: closeModal
   }));
+
+  setTimeout(() => {
+    const addButton = elements.modalRoot.querySelector('.big-account-card [data-action="add"]');
+    addButton?.click();
+    const rows = Array.from(elements.modalRoot.querySelectorAll('tr[data-big-account-row]'));
+    const lastRow = rows[rows.length - 1];
+    if (!lastRow) {
+      return;
+    }
+
+    const merchantInput = lastRow.querySelector('.big-account-merchant-input');
+    const currencySelect = lastRow.querySelector('.big-account-currency-select');
+    if (merchantInput) {
+      merchantInput.value = '8888999900001111';
+    }
+
+    if (currencySelect) {
+      currencySelect.value = 'USD';
+      currencySelect.dispatchEvent(new Event('change'));
+    }
+  }, 40);
+}
+
+function applyBigAccountManagerDropdownPreviewState() {
+  applyBigAccountManagerPreviewState();
+
+  setTimeout(() => {
+    const rows = Array.from(elements.modalRoot.querySelectorAll('tr[data-big-account-row]'));
+    const targetRow = rows[1];
+
+    if (!targetRow) {
+      return;
+    }
+
+    targetRow.querySelector('[data-action="toggle-complete"]')?.click();
+    targetRow.querySelector('.big-account-currency-dropdown-btn')?.click();
+  }, 160);
 }
 
 function applyBigAccountSelectionPreviewState() {
@@ -2179,6 +2443,10 @@ async function initialize() {
   } else if (info.previewModal === 'big-account-manager') {
     setTimeout(() => {
       applyBigAccountManagerPreviewState();
+    }, 120);
+  } else if (info.previewModal === 'big-account-manager-dropdown') {
+    setTimeout(() => {
+      applyBigAccountManagerDropdownPreviewState();
     }, 120);
   } else if (info.previewModal === 'big-account-selection') {
     setTimeout(() => {

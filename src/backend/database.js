@@ -4,6 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
 const FIXED_FIELD_VALUE_PREFIX = '__FIXED__:';
+const MERCHANT_ID_MULTI_ACCOUNT_MARKER = '__MULTI_BIG_ACCOUNT__';
 
 function normalizeText(value) {
   if (value === null || value === undefined) {
@@ -164,17 +165,29 @@ class AppDatabase {
 
   buildTemplateSummaryFromRow(row) {
     const merchantIdMappedField = normalizeText(row.merchantIdMappedField);
+    const merchantIdCustomValue = merchantIdMappedField.startsWith(FIXED_FIELD_VALUE_PREFIX)
+      ? merchantIdMappedField.slice(FIXED_FIELD_VALUE_PREFIX.length)
+      : '';
+    const singleBigAccountMerchantId = normalizeText(row.singleBigAccountMerchantId);
     const bigAccountCount = Number(row.bigAccountCount || 0);
     let bigAccountSummary = '未设置';
     let bigAccountMode = 'unset';
 
     if (merchantIdMappedField.startsWith(FIXED_FIELD_VALUE_PREFIX)) {
       if (bigAccountCount > 0) {
-        bigAccountSummary = `${bigAccountCount}个`;
-        bigAccountMode = 'multiple';
-      } else {
-        bigAccountSummary = '1个';
+        if (bigAccountCount === 1 && singleBigAccountMerchantId) {
+          bigAccountSummary = singleBigAccountMerchantId;
+          bigAccountMode = 'single';
+        } else {
+          bigAccountSummary = `${bigAccountCount}个`;
+          bigAccountMode = 'multiple';
+        }
+      } else if (merchantIdCustomValue && merchantIdCustomValue !== MERCHANT_ID_MULTI_ACCOUNT_MARKER) {
+        bigAccountSummary = merchantIdCustomValue;
         bigAccountMode = 'single';
+      } else {
+        bigAccountSummary = '未设置';
+        bigAccountMode = 'unset';
       }
     } else if (merchantIdMappedField) {
       bigAccountSummary = '来自账单';
@@ -208,7 +221,8 @@ class AppDatabase {
         t.updated_at AS updatedAt,
         COUNT(DISTINCT m.id) AS mappingCount,
         COUNT(DISTINCT ba.merchant_id) AS bigAccountCount,
-        merchant_mapping.mapped_field AS merchantIdMappedField
+        merchant_mapping.mapped_field AS merchantIdMappedField,
+        MIN(ba.merchant_id) AS singleBigAccountMerchantId
       FROM templates t
       LEFT JOIN template_mappings m ON m.template_id = t.id
       LEFT JOIN template_big_accounts ba ON ba.template_id = t.id

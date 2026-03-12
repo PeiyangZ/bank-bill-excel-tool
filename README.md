@@ -4,6 +4,8 @@
 
 完整用户使用说明见 [docs/USER_GUIDE.md](./docs/USER_GUIDE.md)。
 
+版本功能变更清单见 [docs/VERSION_FEATURE_HISTORY.md](./docs/VERSION_FEATURE_HISTORY.md)。
+
 ## 功能
 
 - 导入 Excel / CSV 作为模板文件。
@@ -71,8 +73,8 @@ npm run dist:win
 默认会同时生成安装包和免安装可执行文件：
 
 ```bash
-dist/网银账单小助手-1.3.1-setup.exe
-dist/网银账单小助手-1.3.1-portable.exe
+dist/网银账单小助手-1.3.2-setup.exe
+dist/网银账单小助手-1.3.2-portable.exe
 ```
 
 如果只想生成免安装的单文件 exe：
@@ -114,6 +116,7 @@ npm run dist:win:setup
 
 - `COMMON枚举.xlsx` 已随应用打包，启动后自动加载，不再需要首次导入枚举表。
 - 如果重复导入同名模板，系统会保留模板名称并重置旧映射关系，需重新维护映射。
+- 每次版本迭代时，请同时更新 `CHANGELOG.md` 和 `docs/VERSION_FEATURE_HISTORY.md`。
 
 ## 已知风险
 

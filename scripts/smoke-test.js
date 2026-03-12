@@ -196,6 +196,11 @@ function run() {
     sourceFileName: 'template.xlsx',
     headers
   });
+  const fixedTemplate = db.upsertTemplate({
+    name: 'fixed-template',
+    sourceFileName: 'template.xlsx',
+    headers
+  });
 
   db.setBackgroundConfig({
     colorHex: '#123456',
@@ -205,12 +210,12 @@ function run() {
   assert.strictEqual(db.getBackgroundConfig().colorHex, '#123456');
 
   db.saveMappings(template.id, [
-    { templateField: '原字段A', mappedField: 'Credit Amount' },
-    { templateField: '原字段B', mappedField: 'Debit Amount' },
-    { templateField: '原字段C', mappedField: 'BillDate' },
-    { templateField: '原字段D', mappedField: 'ValueDate' },
-    { templateField: '原字段E', mappedField: 'MerchantId' },
-    { templateField: '原字段F', mappedField: 'Channel' }
+    { templateField: 'Credit Amount', mappedField: '原字段A' },
+    { templateField: 'Debit Amount', mappedField: '原字段B' },
+    { templateField: 'BillDate', mappedField: '原字段C' },
+    { templateField: 'ValueDate', mappedField: '原字段D' },
+    { templateField: 'MerchantId', mappedField: '原字段E' },
+    { templateField: 'Channel', mappedField: '原字段F' }
   ]);
   db.saveMappings(multiTemplate.id, [
     { templateField: 'MerchantId', mappedField: `${FIXED_FIELD_VALUE_PREFIX}__MULTI_BIG_ACCOUNT__` },
@@ -219,6 +224,10 @@ function run() {
     { merchantId: 'BIG_001', currency: 'USD' },
     { merchantId: 'BIG_001', currency: 'HKD' },
     { merchantId: 'BIG_002', currency: 'USD' }
+  ]);
+  db.saveMappings(fixedTemplate.id, [
+    { templateField: 'MerchantId', mappedField: `${FIXED_FIELD_VALUE_PREFIX}62220000000000012345` },
+    { templateField: 'Currency', mappedField: `${FIXED_FIELD_VALUE_PREFIX}USD` }
   ]);
   db.saveAccountMappings([
     {
@@ -239,7 +248,9 @@ function run() {
   assert(enumValues.includes('MerchantId'));
   assert.strictEqual(enumValues.includes('COMMON字段'), false);
   assert(currencyMappings.length > 0);
+  assert.strictEqual(db.listTemplates().find((item) => item.name === 'template').bigAccountSummary, '来自账单');
   assert.strictEqual(db.listTemplates().find((item) => item.name === 'multi-template').bigAccountSummary, '2个');
+  assert.strictEqual(db.listTemplates().find((item) => item.name === 'fixed-template').bigAccountSummary, '62220000000000012345');
   assert.strictEqual(db.getTemplateMappings(multiTemplate.id).bigAccounts.length, 2);
   assert.deepStrictEqual(db.getTemplateMappings(multiTemplate.id).bigAccounts[0].currencies, ['USD', 'HKD']);
 
