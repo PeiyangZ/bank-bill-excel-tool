@@ -149,21 +149,34 @@ function readRowsWithMetadata(filePath, expectedHeaders = []) {
 
   const rows = [];
   const rowNumbers = [];
+  const summaryLabels = [
+    '总收入笔数',
+    '总收入金额',
+    '总支出笔数',
+    '总支出金额'
+  ];
 
-  meaningfulRows.slice(matchedRowIndex).forEach((row, index) => {
+  for (const [index, row] of meaningfulRows.slice(matchedRowIndex).entries()) {
     const normalizedCells = row.cells.slice(matchedColumnIndex, matchedColumnIndex + expectedHeaderCount);
 
     while (normalizedCells.length < expectedHeaderCount) {
       normalizedCells.push('');
     }
 
+    if (
+      index > 0 &&
+      summaryLabels.some((label) => normalizeCell(normalizedCells[0]).includes(label))
+    ) {
+      break;
+    }
+
     if (index > 0 && !isRowMeaningful(normalizedCells)) {
-      return;
+      continue;
     }
 
     rows.push(normalizedCells);
     rowNumbers.push(row.rowNumber);
-  });
+  }
 
   return {
     rows,
@@ -708,7 +721,11 @@ function normalizeDateExportValue(value) {
     );
   }
 
-  const fallback = new Date(candidateValue);
+  const isFallbackCandidate =
+    /[年月日]/.test(candidateValue) ||
+    /^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}$/.test(candidateValue);
+
+  const fallback = isFallbackCandidate ? new Date(candidateValue) : new Date('invalid');
 
   if (!Number.isNaN(fallback.getTime())) {
     const date = new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
@@ -963,11 +980,6 @@ function buildMappedRows({
 
     const mappedRow = orderedTargetFields.map((targetField) => {
       const mappingValue = normalizeCell(mappingByField[targetField]);
-      const isFixedValue = mappingValue.startsWith(FIXED_FIELD_VALUE_PREFIX);
-
-      if (isFixedValue) {
-        return mappingValue.slice(FIXED_FIELD_VALUE_PREFIX.length);
-      }
 
       const sourceField = mappingValue;
       const sourceIndex = sourceIndexByField.get(sourceField);
@@ -1014,6 +1026,10 @@ function buildMappedRows({
           return selectedCurrency;
         }
 
+        if (mappingValue.startsWith(FIXED_FIELD_VALUE_PREFIX)) {
+          return mappingValue.slice(FIXED_FIELD_VALUE_PREFIX.length);
+        }
+
         const currencyResult = resolveCurrencyValue(rawValue, currencyMappings);
 
         if (currencyResult.issue) {
@@ -1032,6 +1048,10 @@ function buildMappedRows({
           return selectedMerchantId;
         }
 
+        if (mappingValue.startsWith(FIXED_FIELD_VALUE_PREFIX)) {
+          return mappingValue.slice(FIXED_FIELD_VALUE_PREFIX.length);
+        }
+
         const originalValue = normalizeCell(rawValue);
 
         if (!originalValue) {
@@ -1041,6 +1061,10 @@ function buildMappedRows({
         return Object.prototype.hasOwnProperty.call(accountMappingByBankId, originalValue)
           ? String(accountMappingByBankId[originalValue])
           : rawValue;
+      }
+
+      if (mappingValue.startsWith(FIXED_FIELD_VALUE_PREFIX)) {
+        return mappingValue.slice(FIXED_FIELD_VALUE_PREFIX.length);
       }
 
       return rawValue ?? '';

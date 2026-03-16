@@ -111,6 +111,7 @@ function run() {
   const simultaneousAmountDataPath = path.join(root, 'input-simultaneous.xlsx');
   const skippedAmountDataPath = path.join(root, 'input-skipped-amounts.xlsx');
   const rawStatementPath = path.join(root, 'input-raw-statement.xlsx');
+  const rawStatementWithSummaryPath = path.join(root, 'input-raw-statement-with-summary.xlsx');
   const detailOutputPath = path.join(root, '2026-03-09', 'detail', 'template-COMMON-2026-03-09~2026-03-10.xlsx');
   const balanceTemplatePath = path.join(root, 'balance-template.xlsx');
   const balanceOutputPath = path.join(root, '2026-03-09', 'balance', 'template-Balance-2026-03-09.xlsx');
@@ -158,6 +159,14 @@ function run() {
     ['', '原字段A', '原字段B', '原字段C', '原字段D', '原字段E', '原字段F', '原字段G', '原字段H', '脏列'],
     ['', '$1,234.56CR', '', '2026-03-09', '20260310', 'NET_001', 88, '美元', 'BAL 456.78元', '忽略'],
     ['', '', 'DB789.01元', '2026-03-10', '20260311', 'NET_002', 99, '港元', '99.99', '忽略']
+  ]);
+  makeWorkbook(rawStatementWithSummaryPath, [
+    ['账户明细', '', '', '', '', '', '', '', ''],
+    ['账号:19-005100048400017', '户名:PING PONG GLOBAL HOLDINGS LIMITED', '币种:美元', '', '', '', '起止日期: 2026年03月01日 - 2026年03月16日', '', ''],
+    ['交易时间', '收入金额', '支出金额', '账户余额', '对方账号', '对方户名', '对方开户行', '交易用途', '摘要'],
+    ['2026-03-02 14:53:51', '', '20000000.00', '59480546.65', 'FTN00107489600196100052', 'PING PONG GLOBAL HOLDINGSLIMITED', '北京银行股份有限公司', 'OUTWARD T/T，NRA PAYMENTNonResident.', '汇款扣款'],
+    ['总收入笔数', '总收入金额', '总支出笔数', '总支出金额', '', '', '', '', ''],
+    ['0', '0.00', '1', '20000000.00', '', '', '', '', '']
   ]);
   makeWorkbook(balanceTemplatePath, [
     ['银行名称', '所在地', '币种', '银行账号', '账单日期', '期初余额', '期初可用余额', '期末余额', '期末可用余额', '扩展字段'],
@@ -277,6 +286,9 @@ function run() {
   assert.strictEqual(normalizeDateExportValue('31-02-2026').value, '');
   assert.strictEqual(normalizeDateExportValue('32012026').value, '');
   assert.strictEqual(normalizeDateExportValue('000000').value, '');
+  assert.strictEqual(normalizeDateExportValue('0').value, '');
+  assert.strictEqual(normalizeDateExportValue('1').value, '');
+  assert.strictEqual(normalizeDateExportValue('0.00').value, '');
   assert.strictEqual(enumValues[0], 'BillDate');
   assert(enumValues.includes('Credit Amount'));
   assert(enumValues.includes('MerchantId'));
@@ -366,8 +378,8 @@ function run() {
       BillDate: '原字段C',
       ValueDate: '原字段D',
       Channel: `${FIXED_FIELD_VALUE_PREFIX}CHB`,
-      MerchantId: '原字段E',
-      Currency: '原字段G',
+      MerchantId: `${FIXED_FIELD_VALUE_PREFIX}__MULTI_BIG_ACCOUNT__`,
+      Currency: `${FIXED_FIELD_VALUE_PREFIX}USD`,
       'Credit Amount': '原字段A',
       'Debit Amount': '原字段B'
     },
@@ -447,6 +459,26 @@ function run() {
   assert.strictEqual(rawStatementRows.rowMetas[0].sourceRowNumber, 3);
   assert.strictEqual(rawStatementRows[1][0], '456.78');
   assert.strictEqual(rawStatementRows[2][0], '99.99');
+
+  const rawStatementWithSummaryRows = buildMappedRows({
+    inputFilePath: rawStatementWithSummaryPath,
+    expectedSourceHeaders: ['交易时间', '收入金额', '支出金额', '账户余额', '对方账号', '对方户名', '对方开户行', '交易用途', '摘要'],
+    mappingByField: {
+      Balance: '账户余额',
+      BillDate: '交易时间',
+      Channel: `${FIXED_FIELD_VALUE_PREFIX}ABC`,
+      MerchantId: `${FIXED_FIELD_VALUE_PREFIX}BIG_001`,
+      Currency: `${FIXED_FIELD_VALUE_PREFIX}USD`,
+      'Credit Amount': '收入金额',
+      'Debit Amount': '支出金额'
+    },
+    orderedTargetFields: ['Balance', 'BillDate', 'Channel', 'MerchantId', 'Currency', 'Credit Amount', 'Debit Amount']
+  });
+  assert.strictEqual(rawStatementWithSummaryRows.length, 2);
+  assert.strictEqual(rawStatementWithSummaryRows.rowMetas[0].sourceRowNumber, 4);
+  assert.strictEqual(rawStatementWithSummaryRows[1][1], '2026-03-02');
+  assert.strictEqual(rawStatementWithSummaryRows[1][3], 'BIG_001');
+  assert.strictEqual(rawStatementWithSummaryRows[1][4], 'USD');
 
   const simultaneousAmountRows = buildMappedRows({
     inputFilePath: simultaneousAmountDataPath,
