@@ -51,6 +51,10 @@ let database = null;
 let lastGeneratedExports = {
   detail: null,
   balance: null,
+  allDetail: null,
+  allBalance: null,
+  statementSessionKey: '',
+  currentBatchId: '',
   newAccount: null
 };
 let lastErrorReport = null;
@@ -58,6 +62,9 @@ let activityLogFilePath = '';
 let lastFileImportContext = null;
 let lastManualBalancePrompt = null;
 let lastPendingBigAccountSelection = null;
+let statementImportSessions = new Map();
+let nextStatementBatchId = 1;
+let nextStatementFileEntryId = 1;
 
 const DEFAULT_BACKGROUND_COLOR = '#efe8da';
 const BUNDLED_ENUM_FILE_NAME = 'COMMON枚举.xlsx';
@@ -96,6 +103,194 @@ function sanitizeFileName(value) {
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, '-')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function cloneRowsWithMetadata(rows = []) {
+  const clonedRows = Array.isArray(rows)
+    ? rows.map((row) => (Array.isArray(row) ? row.slice() : row))
+    : [];
+
+  if (Array.isArray(rows.rowMetas)) {
+    clonedRows.rowMetas = rows.rowMetas.map((meta) => (meta ? { ...meta } : meta));
+  }
+
+  if (Array.isArray(rows.issues)) {
+    clonedRows.issues = rows.issues.map((issue) => ({ ...issue }));
+  }
+
+  if (Array.isArray(rows.skippedRows)) {
+    clonedRows.skippedRows = rows.skippedRows.map((row) => ({ ...row }));
+  }
+
+  if (Array.isArray(rows.simultaneousRows)) {
+    clonedRows.simultaneousRows = rows.simultaneousRows.map((row) => ({ ...row }));
+  }
+
+  if (Array.isArray(rows.sourceRows)) {
+    clonedRows.sourceRows = cloneRowsWithMetadata(rows.sourceRows);
+  }
+
+  return clonedRows;
+}
+
+function normalizeInputFilePaths(inputFilePathOrPaths, { dedupe = true } = {}) {
+  const normalizedPaths = (Array.isArray(inputFilePathOrPaths) ? inputFilePathOrPaths : [inputFilePathOrPaths])
+    .map((filePath) => String(filePath || '').trim())
+    .filter((filePath) => filePath !== '')
+    .map((filePath) => path.resolve(filePath));
+
+  return dedupe ? Array.from(new Set(normalizedPaths)) : normalizedPaths;
+}
+
+function getStatementSessionKey({ templateId, selectedBigAccount = null }) {
+  const merchantId = normalizeCell(selectedBigAccount?.merchantId);
+  const currency = normalizeCell(selectedBigAccount?.currency);
+  return `${templateId || ''}::${merchantId}::${currency}`;
+}
+
+function createStatementImportSession({ templateId, templateName, selectedBigAccount = null }) {
+  return {
+    key: getStatementSessionKey({ templateId, selectedBigAccount }),
+    templateId,
+    templateName,
+    selectedBigAccount: selectedBigAccount
+      ? {
+          merchantId: normalizeCell(selectedBigAccount.merchantId),
+          currency: normalizeCell(selectedBigAccount.currency)
+        }
+      : null,
+    importCount: 0,
+    currentBatchId: '',
+    fileEntries: [],
+    batches: []
+  };
+}
+
+function getOrCreateStatementImportSession({ templateId, templateName, selectedBigAccount = null }) {
+  const sessionKey = getStatementSessionKey({ templateId, selectedBigAccount });
+
+  if (!statementImportSessions.has(sessionKey)) {
+    statementImportSessions.set(
+      sessionKey,
+      createStatementImportSession({ templateId, templateName, selectedBigAccount })
+    );
+  }
+
+  return statementImportSessions.get(sessionKey);
+}
+
+function clearStatementExportCache(sessionKey = '') {
+  if (!sessionKey || lastGeneratedExports.statementSessionKey !== sessionKey) {
+    return;
+  }
+
+  lastGeneratedExports.allDetail = null;
+  lastGeneratedExports.allBalance = null;
+}
+
+function pruneStatementImportSession(session) {
+  session.batches = session.batches
+    .map((batch) => ({
+      ...batch,
+      entryIds: batch.entryIds.filter((entryId) => session.fileEntries.some((entry) => entry.id === entryId))
+    }))
+    .filter((batch) => batch.entryIds.length > 0);
+
+  if (!session.batches.some((batch) => batch.id === session.currentBatchId)) {
+    session.currentBatchId = session.batches[session.batches.length - 1]?.id || '';
+  }
+}
+
+function removeStatementSessionEntriesByFilePath(session, targetFilePath) {
+  const normalizedPath = path.resolve(targetFilePath);
+  const removedEntryIds = session.fileEntries
+    .filter((entry) => entry.filePath === normalizedPath)
+    .map((entry) => entry.id);
+
+  if (!removedEntryIds.length) {
+    return;
+  }
+
+  session.fileEntries = session.fileEntries.filter((entry) => entry.filePath !== normalizedPath);
+  session.batches = session.batches.map((batch) => ({
+    ...batch,
+    entryIds: batch.entryIds.filter((entryId) => !removedEntryIds.includes(entryId))
+  }));
+  pruneStatementImportSession(session);
+}
+
+function buildStatementBatchId() {
+  const batchId = `batch-${nextStatementBatchId}`;
+  nextStatementBatchId += 1;
+  return batchId;
+}
+
+function buildStatementFileEntryId() {
+  const entryId = `entry-${nextStatementFileEntryId}`;
+  nextStatementFileEntryId += 1;
+  return entryId;
+}
+
+function buildStatementFileEntry({ filePath, detailRows }) {
+  return {
+    id: buildStatementFileEntryId(),
+    filePath: path.resolve(filePath),
+    detailRows: cloneRowsWithMetadata(detailRows)
+  };
+}
+
+function getStatementSessionEntries(session, scope = 'all') {
+  if (!session) {
+    return [];
+  }
+
+  if (scope === 'current') {
+    const currentBatch = session.batches.find((batch) => batch.id === session.currentBatchId);
+
+    if (!currentBatch) {
+      return [];
+    }
+
+    return currentBatch.entryIds
+      .map((entryId) => session.fileEntries.find((entry) => entry.id === entryId))
+      .filter(Boolean);
+  }
+
+  return session.fileEntries.slice();
+}
+
+function mergeMappedDetailRows(mappedRowsList = []) {
+  const nonEmptyRows = mappedRowsList.filter((rows) => Array.isArray(rows) && rows.length > 0);
+
+  if (!nonEmptyRows.length) {
+    return [];
+  }
+
+  const mergedRows = [Array.isArray(nonEmptyRows[0][0]) ? nonEmptyRows[0][0].slice() : []];
+  const mergedRowMetas = [];
+  const mergedIssues = [];
+
+  nonEmptyRows.forEach((rows) => {
+    rows.slice(1).forEach((row) => {
+      mergedRows.push(Array.isArray(row) ? row.slice() : row);
+    });
+
+    if (Array.isArray(rows.rowMetas)) {
+      rows.rowMetas.forEach((meta) => {
+        mergedRowMetas.push(meta ? { ...meta } : meta);
+      });
+    }
+
+    if (Array.isArray(rows.issues)) {
+      rows.issues.forEach((issue) => {
+        mergedIssues.push({ ...issue });
+      });
+    }
+  });
+
+  mergedRows.rowMetas = mergedRowMetas;
+  mergedRows.issues = mergedIssues;
+  return mergedRows;
 }
 
 function getAppRootDirectory() {
@@ -209,13 +404,19 @@ function rememberLastFileImportContext(context = null) {
         template: context.template,
         mappings: Array.isArray(context.mappings) ? context.mappings.map((mapping) => ({ ...mapping })) : [],
         orderedTargetFields: Array.isArray(context.orderedTargetFields) ? context.orderedTargetFields.slice() : [],
-        inputFilePath: context.inputFilePath,
+        inputFilePaths: normalizeInputFilePaths(context.inputFilePaths || context.inputFilePath),
         selectedBigAccount: context.selectedBigAccount
           ? {
               merchantId: normalizeCell(context.selectedBigAccount.merchantId),
               currency: normalizeCell(context.selectedBigAccount.currency)
             }
-          : null
+          : null,
+        preparedDetailRows: context.preparedDetailRows
+          ? cloneRowsWithMetadata(context.preparedDetailRows)
+          : null,
+        scope: normalizeCell(context.scope) || 'current',
+        statementSessionKey: normalizeCell(context.statementSessionKey),
+        currentBatchId: normalizeCell(context.currentBatchId)
       }
     : null;
 }
@@ -227,7 +428,7 @@ function rememberPendingBigAccountSelection(context = null) {
         template: context.template,
         mappings: Array.isArray(context.mappings) ? context.mappings.map((mapping) => ({ ...mapping })) : [],
         orderedTargetFields: Array.isArray(context.orderedTargetFields) ? context.orderedTargetFields.slice() : [],
-        inputFilePath: context.inputFilePath,
+        inputFilePaths: normalizeInputFilePaths(context.inputFilePaths || context.inputFilePath),
         options: Array.isArray(context.options)
           ? context.options.map((option) => ({
               merchantId: normalizeCell(option.merchantId),
@@ -1020,20 +1221,40 @@ function buildOutputFilePath({ kind, outputFileName }) {
   };
 }
 
-function buildStatementOutputFilePath({ kind, templateName, merchantId = '', outputTag, dateRangeLabel }) {
+function buildStatementOutputFilePath({
+  kind,
+  templateName,
+  merchantId = '',
+  outputTag,
+  dateRangeLabel,
+  internalSuffix = ''
+}) {
   const safeDateLabel = dateRangeLabel || getToday();
-  return buildOutputFilePath({
+  const publicFileName = merchantId
+    ? `${templateName}-${merchantId}-${outputTag}-${safeDateLabel}.xlsx`
+    : `${templateName}-${outputTag}-${safeDateLabel}.xlsx`;
+  const internalFileName = internalSuffix
+    ? publicFileName.replace(/\.xlsx$/i, `__${internalSuffix}.xlsx`)
+    : publicFileName;
+  const outputMeta = buildOutputFilePath({
     kind,
-    outputFileName: merchantId
-      ? `${templateName}-${merchantId}-${outputTag}-${safeDateLabel}.xlsx`
-      : `${templateName}-${outputTag}-${safeDateLabel}.xlsx`
+    outputFileName: internalFileName
   });
+
+  return {
+    ...outputMeta,
+    outputFileName: publicFileName
+  };
 }
 
 function clearGeneratedExports() {
   lastGeneratedExports = {
     detail: null,
     balance: null,
+    allDetail: null,
+    allBalance: null,
+    statementSessionKey: '',
+    currentBatchId: '',
     newAccount: lastGeneratedExports.newAccount
   };
 }
@@ -1230,7 +1451,6 @@ function deriveBalanceRecords({
 
   const groupedRows = new Map();
   const bankNameParts = splitTemplateName(templateName);
-  const currencies = [];
   const bankAccounts = [];
   const missingMerchantIdRows = [];
 
@@ -1277,14 +1497,17 @@ function deriveBalanceRecords({
       return;
     }
 
-    currencies.push(currency);
     bankAccounts.push(bankAccount);
 
-    if (!groupedRows.has(dateLabel)) {
-      groupedRows.set(dateLabel, []);
+    if (!groupedRows.has(currency)) {
+      groupedRows.set(currency, new Map());
     }
 
-    groupedRows.get(dateLabel).push({
+    if (!groupedRows.get(currency).has(dateLabel)) {
+      groupedRows.get(currency).set(dateLabel, []);
+    }
+
+    groupedRows.get(currency).get(dateLabel).push({
       balanceValue,
       creditAmount,
       debitAmount
@@ -1304,85 +1527,91 @@ function deriveBalanceRecords({
     );
   }
 
-  const dateKeys = Array.from(groupedRows.keys()).sort();
+  const groupedCurrencies = Array.from(groupedRows.keys()).sort();
 
-  if (!dateKeys.length) {
+  if (!groupedCurrencies.length) {
     throw new FileValidationError('FILE_READ', '导入文件中未找到可用于余额账单的账单日期');
   }
 
-  const currency = pickSingleTextValue(currencies, 'Currency');
   const bankAccount = pickSingleTextValue(bankAccounts, '银行账号');
   const records = [];
   const seedRecords = [];
-  let previousEndBalance = null;
+  const allBillDates = new Set();
 
-  dateKeys.forEach((dateLabel) => {
-    const entries = groupedRows.get(dateLabel);
-    const promptContext = buildBalanceSeedPrompt({
-      templateName,
-      bankName: bankNameParts.bankName,
-      merchantId: bankAccount,
-      currency,
-      targetBillDate: dateLabel
-    });
-    let endBalance = null;
+  groupedCurrencies.forEach((currency) => {
+    const currencyDateMap = groupedRows.get(currency);
+    const dateKeys = Array.from(currencyDateMap.keys()).sort();
+    let previousEndBalance = null;
 
-    if (mode === 'calculated') {
-      const effectivePreviousEndBalance = resolveSeededPreviousEndBalance({
-        previousEndBalance,
-        resolvePreviousEndBalance,
-        promptContext,
-        shouldPrompt: true
+    dateKeys.forEach((dateLabel) => {
+      const entries = currencyDateMap.get(dateLabel);
+      const promptContext = buildBalanceSeedPrompt({
+        templateName,
+        bankName: bankNameParts.bankName,
+        merchantId: bankAccount,
+        currency,
+        targetBillDate: dateLabel
       });
-      endBalance = calculateEndingBalanceFromAmounts({
-        previousEndBalance: effectivePreviousEndBalance,
-        entries
-      });
-    } else {
-      let effectivePreviousEndBalance = previousEndBalance;
+      let endBalance = null;
 
-      if (effectivePreviousEndBalance === null && hasMultipleEndingBalances(entries)) {
-        effectivePreviousEndBalance = resolveSeededPreviousEndBalance({
+      if (mode === 'calculated') {
+        const effectivePreviousEndBalance = resolveSeededPreviousEndBalance({
           previousEndBalance,
           resolvePreviousEndBalance,
           promptContext,
           shouldPrompt: true
         });
+        endBalance = calculateEndingBalanceFromAmounts({
+          previousEndBalance: effectivePreviousEndBalance,
+          entries
+        });
+      } else {
+        let effectivePreviousEndBalance = previousEndBalance;
+
+        if (effectivePreviousEndBalance === null && hasMultipleEndingBalances(entries)) {
+          effectivePreviousEndBalance = resolveSeededPreviousEndBalance({
+            previousEndBalance,
+            resolvePreviousEndBalance,
+            promptContext,
+            shouldPrompt: true
+          });
+        }
+
+        endBalance = inferEndingBalance({
+          previousEndBalance: effectivePreviousEndBalance,
+          entries,
+          dateLabel
+        });
       }
 
-      endBalance = inferEndingBalance({
-        previousEndBalance: effectivePreviousEndBalance,
-        entries,
-        dateLabel
+      previousEndBalance = endBalance;
+      allBillDates.add(dateLabel);
+      records.push(buildBalanceTemplateRow(balanceTemplateFields, {
+        银行名称: bankNameParts.bankName,
+        所在地: bankNameParts.location,
+        币种: currency,
+        银行账号: bankAccount,
+        账单日期: dateLabel,
+        期初余额: '',
+        期初可用余额: '',
+        期末余额: endBalance,
+        期末可用余额: ''
+      }));
+      seedRecords.push({
+        merchantId: bankAccount,
+        currency,
+        billDate: dateLabel,
+        endBalance,
+        generationMethod: mode === 'calculated'
+          ? BALANCE_SEED_GENERATION_METHODS.calculated
+          : BALANCE_SEED_GENERATION_METHODS.statement
       });
-    }
-
-    previousEndBalance = endBalance;
-    records.push(buildBalanceTemplateRow(balanceTemplateFields, {
-      银行名称: bankNameParts.bankName,
-      所在地: bankNameParts.location,
-      币种: currency,
-      银行账号: bankAccount,
-      账单日期: dateLabel,
-      期初余额: '',
-      期初可用余额: '',
-      期末余额: endBalance,
-      期末可用余额: ''
-    }));
-    seedRecords.push({
-      merchantId: bankAccount,
-      currency,
-      billDate: dateLabel,
-      endBalance,
-      generationMethod: mode === 'calculated'
-        ? BALANCE_SEED_GENERATION_METHODS.calculated
-        : BALANCE_SEED_GENERATION_METHODS.statement
     });
   });
 
   return {
     records,
-    billDates: dateKeys,
+    billDates: Array.from(allBillDates).sort(),
     seedRecords
   };
 }
@@ -2426,11 +2655,10 @@ function buildMappedFieldLookup(mappings) {
   }, {});
 }
 
-function prepareGeneratedFiles({
+function buildStatementGenerationConfig({
   template,
   mappings,
   orderedTargetFields,
-  inputFilePath,
   selectedBigAccount = null
 }) {
   const selectedMappings = mappings.filter((mapping) => {
@@ -2469,7 +2697,11 @@ function prepareGeneratedFiles({
 
   let currencyMappings = [];
 
-  if (mappingByTargetField.Currency && !mappingByTargetField.Currency.startsWith(FIXED_FIELD_VALUE_PREFIX)) {
+  if (
+    mappingByTargetField.Currency &&
+    !selectedCurrency &&
+    !mappingByTargetField.Currency.startsWith(FIXED_FIELD_VALUE_PREFIX)
+  ) {
     const currencyMappingTablePath = getCurrencyMappingTablePath();
 
     if (!fs.existsSync(currencyMappingTablePath)) {
@@ -2486,28 +2718,90 @@ function prepareGeneratedFiles({
         .filter((fieldName) => fieldName !== '')
     )
   );
+
   const accountMappingByBankId = database.listAccountMappings().reduce((accumulator, mapping) => {
     accumulator[mapping.bankAccountId] = mapping.clearingAccountId;
     return accumulator;
   }, {});
-  const detailRows = buildMappedRows({
-    inputFilePath,
-    orderedTargetFields: exportTargetFields,
-    mappingByField: mappingByTargetField,
+
+  return {
+    template,
+    mappingByTargetField,
+    selectedMerchantId,
+    selectedCurrency,
+    balanceRequested: Boolean(mappingByTargetField.Balance),
+    balanceMode: mappingByTargetField.Balance === BALANCE_CALCULATED_OPTION ? 'calculated' : 'statement',
+    exportTargetFields,
     accountMappingByBankId,
     currencyMappings,
     amountMappingRules: {
       signedAmountSourceField: mappingByTargetField[SIGNED_AMOUNT_MAPPING_FIELD],
       nameSourceField: mappingByTargetField[AMOUNT_BASED_NAME_MAPPING_FIELD],
       accountSourceField: mappingByTargetField[AMOUNT_BASED_ACCOUNT_MAPPING_FIELD]
-    },
-    expectedSourceHeaders: template.headers,
+    }
+  };
+}
+
+function buildMappedRowsForFile({
+  config,
+  inputFilePath
+}) {
+  return buildMappedRows({
+    inputFilePath,
+    orderedTargetFields: config.exportTargetFields,
+    mappingByField: config.mappingByTargetField,
+    accountMappingByBankId: config.accountMappingByBankId,
+    currencyMappings: config.currencyMappings,
+    amountMappingRules: config.amountMappingRules,
+    expectedSourceHeaders: config.template.headers,
     selectedBigAccount: {
-      merchantId: selectedMerchantId,
-      currency: selectedCurrency
+      merchantId: config.selectedMerchantId,
+      currency: config.selectedCurrency
     }
   });
-  const warnings = Array.isArray(detailRows.issues) ? detailRows.issues.slice() : [];
+}
+
+function buildPreparedStatementBatchFromEntries({ config, fileEntries = [] }) {
+  const detailRows = mergeMappedDetailRows(fileEntries.map((entry) => entry.detailRows));
+
+  return {
+    detailRows,
+    warnings: Array.isArray(detailRows.issues) ? detailRows.issues.slice() : [],
+    balanceRequested: Boolean(config.balanceRequested),
+    balanceMode: config.balanceMode,
+    selectedMerchantId: config.selectedMerchantId,
+    selectedCurrency: config.selectedCurrency,
+    inputFilePaths: fileEntries.map((entry) => entry.filePath)
+  };
+}
+
+function buildPreparedStatementBatchFromFilePaths({ config, inputFilePaths = [] }) {
+  const fileEntries = normalizeInputFilePaths(inputFilePaths, { dedupe: false }).map((inputFilePath) => ({
+    filePath: inputFilePath,
+    detailRows: buildMappedRowsForFile({
+      config,
+      inputFilePath
+    })
+  }));
+
+  return {
+    fileEntries,
+    preparedBatch: buildPreparedStatementBatchFromEntries({
+      config,
+      fileEntries
+    })
+  };
+}
+
+function generateStatementFiles({
+  config,
+  preparedBatch,
+  scope = 'current',
+  includeDetail = true,
+  includeBalance = null
+}) {
+  const warnings = Array.isArray(preparedBatch.warnings) ? preparedBatch.warnings.slice() : [];
+  const detailRows = cloneRowsWithMetadata(preparedBatch.detailRows);
   const detailExportRows = buildDetailExportRows(detailRows);
   const effectiveDetailRows = Array.isArray(detailExportRows.sourceRows) ? detailExportRows.sourceRows : detailRows;
   const skippedDetailRows = Array.isArray(detailExportRows.skippedRows) ? detailExportRows.skippedRows : [];
@@ -2524,8 +2818,8 @@ function prepareGeneratedFiles({
           return `第${row.sourceRowNumber}行，Credit Amount="${row.creditAmount || '(空)'}"，Debit Amount="${row.debitAmount || '(空)'}"`;
         }),
         context: {
-          inputFilePath,
-          templateName: template.name
+          inputFilePath: preparedBatch.inputFilePaths.join(';'),
+          templateName: config.template.name
         }
       }
     );
@@ -2544,35 +2838,44 @@ function prepareGeneratedFiles({
     ? parseRequiredBillDates(detailExportRows)
     : parseRequiredBillDates(detailRows);
   const dateRangeLabel = buildDateRangeLabel(billDates);
-  const detailOutput = buildStatementOutputFilePath({
-    kind: 'detail',
-    templateName: template.name,
-    merchantId: selectedMerchantId,
-    outputTag: 'COMMON',
-    dateRangeLabel
-  });
-
-  writeWorkbookRows({
-    rows: detailExportRows,
-    outputFilePath: detailOutput.outputFilePath
-  });
+  const internalSuffix = scope === 'all' ? 'all' : '';
 
   const result = {
-    detail: {
-      filePath: detailOutput.outputFilePath,
-      fileName: detailOutput.outputFileName,
-      templateName: template.name
-    },
+    detail: null,
     balance: null,
-    message: '明细账单可导出',
+    message: includeDetail && includeBalance !== true ? '明细账单可导出' : '',
     warnings,
-    balanceRequested: Boolean(mappingByTargetField.Balance)
+    balanceRequested: Boolean(preparedBatch.balanceRequested)
   };
 
-  if (mappingByTargetField.Balance) {
-    const balanceMode = mappingByTargetField.Balance === BALANCE_CALCULATED_OPTION ? 'calculated' : 'statement';
+  if (includeDetail) {
+    const detailOutput = buildStatementOutputFilePath({
+      kind: 'detail',
+      templateName: config.template.name,
+      merchantId: preparedBatch.selectedMerchantId,
+      outputTag: 'COMMON',
+      dateRangeLabel,
+      internalSuffix
+    });
 
-    if (!mappingByTargetField.MerchantId) {
+    writeWorkbookRows({
+      rows: detailExportRows,
+      outputFilePath: detailOutput.outputFilePath
+    });
+
+    result.detail = {
+      filePath: detailOutput.outputFilePath,
+      fileName: detailOutput.outputFileName,
+      templateName: config.template.name
+    };
+  }
+
+  const shouldGenerateBalance = includeBalance === null
+    ? Boolean(preparedBatch.balanceRequested)
+    : Boolean(includeBalance) && Boolean(preparedBatch.balanceRequested);
+
+  if (shouldGenerateBalance) {
+    if (!config.mappingByTargetField.MerchantId) {
       throw new FileValidationError('FILE_READ', '当前模板启用 Balance 时必须映射 MerchantId 字段');
     }
 
@@ -2591,9 +2894,9 @@ function prepareGeneratedFiles({
 
       const balanceResult = deriveBalanceRecords({
         detailRows: effectiveDetailRows,
-        templateName: template.name,
+        templateName: config.template.name,
         balanceTemplateFields,
-        mode: balanceMode,
+        mode: preparedBatch.balanceMode,
         resolvePreviousEndBalance: ({ bankName, merchantId, currency, targetBillDate }) => {
           const seedRecord = findPreviousBalanceSeed(ensureStorageRoot(), {
             bankName,
@@ -2607,10 +2910,11 @@ function prepareGeneratedFiles({
       });
       const balanceOutput = buildStatementOutputFilePath({
         kind: 'balance',
-        templateName: template.name,
-        merchantId: selectedMerchantId,
-        outputTag: 'Balance',
-        dateRangeLabel: buildDateRangeLabel(balanceResult.billDates)
+        templateName: config.template.name,
+        merchantId: preparedBatch.selectedMerchantId,
+        outputTag: 'BALANCE',
+        dateRangeLabel: buildDateRangeLabel(balanceResult.billDates),
+        internalSuffix
       });
 
       writeBalanceWorkbook({
@@ -2620,16 +2924,16 @@ function prepareGeneratedFiles({
         outputFilePath: balanceOutput.outputFilePath
       });
       storeGeneratedBalanceSeeds({
-        templateName: template.name,
+        templateName: config.template.name,
         seedRecords: balanceResult.seedRecords
       });
 
       result.balance = {
         filePath: balanceOutput.outputFilePath,
         fileName: balanceOutput.outputFileName,
-        templateName: template.name
+        templateName: config.template.name
       };
-      result.message = '明细账单可导出，余额账单可导出';
+      result.message = includeDetail ? '明细账单可导出，余额账单可导出' : '余额账单可导出';
     } catch (error) {
       if (error instanceof FileValidationError) {
         if (error.code === 'BALANCE_SEED_REQUIRED') {
@@ -2637,8 +2941,8 @@ function prepareGeneratedFiles({
             type: 'balance-seed-required',
             message: error.message,
             prompt: {
-              templateName: template.name,
-              bankName: error.context?.bankName || splitTemplateName(template.name).bankName,
+              templateName: config.template.name,
+              bankName: error.context?.bankName || splitTemplateName(config.template.name).bankName,
               merchantId: normalizeCell(error.context?.merchantId),
               currency: normalizeCell(error.context?.currency),
               targetBillDate: normalizeCell(error.context?.targetBillDate)
@@ -2662,6 +2966,37 @@ function prepareGeneratedFiles({
   }
 
   return result;
+}
+
+function prepareGeneratedFiles({
+  template,
+  mappings,
+  orderedTargetFields,
+  inputFilePath,
+  inputFilePaths,
+  selectedBigAccount = null,
+  scope = 'current'
+}) {
+  const config = buildStatementGenerationConfig({
+    template,
+    mappings,
+    orderedTargetFields,
+    selectedBigAccount
+  });
+  const prepared = buildPreparedStatementBatchFromFilePaths({
+    config,
+    inputFilePaths: inputFilePaths || inputFilePath
+  });
+
+  return {
+    ...generateStatementFiles({
+      config,
+      preparedBatch: prepared.preparedBatch,
+      scope
+    }),
+    fileEntries: prepared.fileEntries,
+    preparedBatch: prepared.preparedBatch
+  };
 }
 
 async function exportGeneratedFile(generatedFile, emptyMessage, step) {
@@ -2728,9 +3063,11 @@ function buildImportResultFromGeneratedFiles({
   generatedFiles,
   templateId,
   templateName,
-  inputFilePath
+  inputFilePath,
+  inputFilePaths
 }) {
   const manualBalanceWarning = extractManualBalancePromptWarning(generatedFiles.warnings);
+  const normalizedInputFilePaths = normalizeInputFilePaths(inputFilePaths || inputFilePath);
 
   if (manualBalanceWarning) {
     return buildManualBalanceRequiredResult(manualBalanceWarning.prompt, generatedFiles);
@@ -2769,7 +3106,9 @@ function buildImportResultFromGeneratedFiles({
     message: '导入网银明细文件成功',
     details: [
       `模板名：${templateName}`,
-      `源文件：${inputFilePath}`,
+      normalizedInputFilePaths.length > 1
+        ? `源文件：${normalizedInputFilePaths.join('；')}`
+        : `源文件：${normalizedInputFilePaths[0] || inputFilePath || ''}`,
       generatedFiles.balance ? '已生成余额账单' : '仅生成明细账单'
     ]
   });
@@ -2780,6 +3119,347 @@ function buildImportResultFromGeneratedFiles({
     detailReady: Boolean(generatedFiles.detail),
     balanceReady: Boolean(generatedFiles.balance)
   };
+}
+
+function appendStatementSessionImport(session, fileEntries = []) {
+  const batchId = buildStatementBatchId();
+  const normalizedEntries = fileEntries.map((entry) => ({
+    ...entry,
+    detailRows: cloneRowsWithMetadata(entry.detailRows)
+  }));
+
+  session.importCount += 1;
+  session.currentBatchId = batchId;
+  session.fileEntries.push(...normalizedEntries);
+  session.batches.push({
+    id: batchId,
+    entryIds: normalizedEntries.map((entry) => entry.id),
+    importedAt: new Date().toISOString()
+  });
+  clearStatementExportCache(session.key);
+  return batchId;
+}
+
+function buildPreparedBatchFromStatementSession({
+  session,
+  config,
+  scope = 'all'
+}) {
+  return buildPreparedStatementBatchFromEntries({
+    config,
+    fileEntries: getStatementSessionEntries(session, scope)
+  });
+}
+
+async function resolveImportFileSelection({
+  templateName,
+  session,
+  filePaths
+}) {
+  const acceptedPaths = [];
+  const replacePaths = [];
+
+  for (const rawPath of normalizeInputFilePaths(filePaths, { dedupe: false })) {
+    const normalizedPath = path.resolve(rawPath);
+    const duplicateInCurrentBatch = acceptedPaths.includes(normalizedPath);
+    const duplicateInSession = session.fileEntries.some((entry) => entry.filePath === normalizedPath);
+
+    if (!duplicateInCurrentBatch && !duplicateInSession) {
+      acceptedPaths.push(normalizedPath);
+      continue;
+    }
+
+    const message = duplicateInCurrentBatch
+      ? `当前批次已重复选择文件：\n${normalizedPath}\n\n请选择覆盖当前批次中的旧记录，还是保留两份。`
+      : `该文件在当前模板的本次会话中已导入过：\n${normalizedPath}\n\n请选择覆盖旧记录，还是保留两份。`;
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'question',
+      buttons: ['覆盖旧记录', '保留两份', '取消本次导入'],
+      defaultId: 0,
+      cancelId: 2,
+      message: `检测到重复文件（模板：${templateName}）`,
+      detail: message
+    });
+
+    if (result.response === 2) {
+      return {
+        status: 'cancelled',
+        filePaths: []
+      };
+    }
+
+    if (result.response === 0) {
+      if (duplicateInCurrentBatch) {
+        const existingIndex = acceptedPaths.findIndex((filePath) => filePath === normalizedPath);
+
+        if (existingIndex >= 0) {
+          acceptedPaths.splice(existingIndex, 1);
+        }
+      }
+
+      if (duplicateInSession) {
+        replacePaths.push(normalizedPath);
+      }
+
+      acceptedPaths.push(normalizedPath);
+      continue;
+    }
+
+    acceptedPaths.push(normalizedPath);
+  }
+
+  return {
+    status: 'success',
+    filePaths: acceptedPaths,
+    replacePaths: Array.from(new Set(replacePaths))
+  };
+}
+
+function buildScopeSelectionResult(kind) {
+  return {
+    status: 'select-export-scope',
+    kind,
+    options: [
+      {
+        scope: 'current',
+        label: `导出当前文件的${kind === 'detail' ? '明细' : '余额'}`
+      },
+      {
+        scope: 'all',
+        label: `导出所有${kind === 'detail' ? '明细' : '余额'}`
+      }
+    ]
+  };
+}
+
+function getCurrentStatementSession() {
+  const sessionKey = normalizeCell(lastGeneratedExports.statementSessionKey);
+  return sessionKey ? statementImportSessions.get(sessionKey) || null : null;
+}
+
+function shouldPromptForExportScope(session) {
+  return Boolean(session && session.importCount >= 2);
+}
+
+function createGenerationContext({
+  templateId,
+  template,
+  mappings,
+  orderedTargetFields,
+  inputFilePaths = [],
+  selectedBigAccount = null,
+  preparedDetailRows = null,
+  scope = 'current',
+  statementSessionKey = '',
+  currentBatchId = ''
+}) {
+  return {
+    templateId,
+    template,
+    mappings,
+    orderedTargetFields,
+    inputFilePaths: normalizeInputFilePaths(inputFilePaths),
+    selectedBigAccount,
+    preparedDetailRows: preparedDetailRows ? cloneRowsWithMetadata(preparedDetailRows) : null,
+    scope,
+    statementSessionKey,
+    currentBatchId
+  };
+}
+
+function generateFilesFromRememberedContext(context) {
+  if (!context) {
+    throw new FileValidationError('FILE_READ', '当前没有可重新生成的导入上下文，请重新导入文件');
+  }
+
+  const config = buildStatementGenerationConfig({
+    template: context.template,
+    mappings: context.mappings,
+    orderedTargetFields: context.orderedTargetFields,
+    selectedBigAccount: context.selectedBigAccount
+  });
+  const preparedBatch = context.preparedDetailRows
+    ? buildPreparedStatementBatchFromEntries({
+        config,
+        fileEntries: [{
+          id: 'cached-context',
+          filePath: '__cached__',
+          detailRows: context.preparedDetailRows
+        }]
+      })
+    : buildPreparedStatementBatchFromFilePaths({
+        config,
+        inputFilePaths: context.inputFilePaths
+      }).preparedBatch;
+
+  return generateStatementFiles({
+    config,
+    preparedBatch,
+    scope: context.scope || 'current'
+  });
+}
+
+function cacheCurrentStatementExports({
+  session,
+  generatedFiles
+}) {
+  lastGeneratedExports.detail = generatedFiles.detail;
+  lastGeneratedExports.balance = generatedFiles.balance;
+  lastGeneratedExports.allDetail = null;
+  lastGeneratedExports.allBalance = null;
+  lastGeneratedExports.statementSessionKey = session?.key || '';
+  lastGeneratedExports.currentBatchId = session?.currentBatchId || '';
+}
+
+function cacheAllStatementExport(kind, generatedFile) {
+  if (kind === 'detail') {
+    lastGeneratedExports.allDetail = generatedFile;
+    return;
+  }
+
+  if (kind === 'balance') {
+    lastGeneratedExports.allBalance = generatedFile;
+  }
+}
+
+function updateStatementSessionCache(session, batchId, generatedFiles) {
+  session.currentBatchId = batchId;
+  cacheCurrentStatementExports({
+    session,
+    generatedFiles
+  });
+}
+
+function buildStatementSessionGenerationContext({
+  session,
+  template,
+  mappings,
+  orderedTargetFields,
+  scope
+}) {
+  const config = buildStatementGenerationConfig({
+    template,
+    mappings,
+    orderedTargetFields,
+    selectedBigAccount: session.selectedBigAccount
+  });
+  const preparedBatch = buildPreparedBatchFromStatementSession({
+    session,
+    config,
+    scope
+  });
+
+  return {
+    config,
+    preparedBatch
+  };
+}
+
+function getGeneratedStatementExport(kind, scope = 'current') {
+  if (scope === 'all') {
+    return kind === 'detail' ? lastGeneratedExports.allDetail : lastGeneratedExports.allBalance;
+  }
+
+  return kind === 'detail' ? lastGeneratedExports.detail : lastGeneratedExports.balance;
+}
+
+async function exportStatementByScope(kind, scope = 'auto') {
+  const session = getCurrentStatementSession();
+  const normalizedScope = scope === 'all' || scope === 'current'
+    ? scope
+    : shouldPromptForExportScope(session)
+      ? 'select'
+      : 'current';
+
+  if (normalizedScope === 'select') {
+    return buildScopeSelectionResult(kind);
+  }
+
+  const emptyMessage = normalizedScope === 'all'
+    ? `暂无可导出的全部${kind === 'detail' ? '明细' : '余额'}账单`
+    : `暂无可导出的${kind === 'detail' ? '明细' : '余额'}账单`;
+  let generatedFile = getGeneratedStatementExport(kind, normalizedScope);
+
+  if (!generatedFile && normalizedScope === 'all') {
+    if (!session) {
+      return createErrorResult({
+        step: kind === 'detail' ? '导出明细账单' : '导出余额账单',
+        message: emptyMessage,
+        errorCode: 'EXPORT_EMPTY'
+      });
+    }
+
+    const templateConfig = getTemplateMappingConfig(session.templateId);
+
+    if (!templateConfig) {
+      return createErrorResult({
+        step: kind === 'detail' ? '导出明细账单' : '导出余额账单',
+        message: '未找到当前模板，请重新选择模板后导入文件',
+        errorCode: 'TEMPLATE_NOT_FOUND',
+        templateName: session.templateName
+      });
+    }
+
+    const { config, preparedBatch } = buildStatementSessionGenerationContext({
+      session,
+      template: templateConfig.template,
+      mappings: templateConfig.exportMappings,
+      orderedTargetFields: templateConfig.exportTargetFields,
+      scope: 'all'
+    });
+
+    if (kind === 'balance') {
+      rememberLastFileImportContext(createGenerationContext({
+        templateId: session.templateId,
+        template: templateConfig.template,
+        mappings: templateConfig.exportMappings,
+        orderedTargetFields: templateConfig.exportTargetFields,
+        selectedBigAccount: session.selectedBigAccount,
+        preparedDetailRows: preparedBatch.detailRows,
+        scope: 'all',
+        statementSessionKey: session.key,
+        currentBatchId: session.currentBatchId
+      }));
+    }
+
+    const generatedFiles = generateStatementFiles({
+      config,
+      preparedBatch,
+      scope: 'all',
+      includeDetail: kind === 'detail',
+      includeBalance: kind === 'balance'
+    });
+
+    if (kind === 'detail') {
+      cacheAllStatementExport('detail', generatedFiles.detail);
+      generatedFile = generatedFiles.detail;
+    } else {
+      const manualBalanceWarning = extractManualBalancePromptWarning(generatedFiles.warnings);
+
+      if (manualBalanceWarning) {
+        return buildManualBalanceRequiredResult(manualBalanceWarning.prompt, generatedFiles);
+      }
+
+      if (!generatedFiles.balance) {
+        const balanceWarning = generatedFiles.warnings.find((warning) => warning.type === 'balance-generate-failed');
+        return createErrorResult({
+          step: '导出余额账单',
+          message: balanceWarning?.message || emptyMessage,
+          errorCode: 'EXPORT_EMPTY',
+          templateName: session.templateName
+        });
+      }
+
+      cacheAllStatementExport('balance', generatedFiles.balance);
+      generatedFile = generatedFiles.balance;
+    }
+  }
+
+  return exportGeneratedFile(
+    generatedFile,
+    emptyMessage,
+    kind === 'detail' ? '导出明细账单' : '导出余额账单'
+  );
 }
 
 function registerFileHandlers() {
@@ -2817,7 +3497,7 @@ function registerFileHandlers() {
       }
 
       const result = await dialog.showOpenDialog(mainWindow, {
-        properties: ['openFile'],
+        properties: ['openFile', 'multiSelections'],
         filters: fileDialogFilters()
       });
 
@@ -2825,7 +3505,7 @@ function registerFileHandlers() {
         return { status: 'cancelled' };
       }
 
-      const inputFilePath = result.filePaths[0];
+      const inputFilePaths = normalizeInputFilePaths(result.filePaths, { dedupe: false });
       const bigAccountOptions = expandBigAccountConfigurations(templateConfig.bigAccounts);
 
       if (bigAccountOptions.length > 1) {
@@ -2834,7 +3514,7 @@ function registerFileHandlers() {
           template: templateConfig.template,
           mappings: templateConfig.exportMappings,
           orderedTargetFields: templateConfig.exportTargetFields,
-          inputFilePath,
+          inputFilePaths,
           options: bigAccountOptions
         });
         return buildBigAccountSelectionRequiredResult(bigAccountOptions);
@@ -2847,31 +3527,56 @@ function registerFileHandlers() {
           }
         : null;
 
+      const session = getOrCreateStatementImportSession({
+        templateId,
+        templateName: templateConfig.template.name,
+        selectedBigAccount
+      });
+      const selectionResult = await resolveImportFileSelection({
+        templateName: templateConfig.template.name,
+        session,
+        filePaths: inputFilePaths
+      });
+
+      if (selectionResult.status === 'cancelled' || selectionResult.filePaths.length === 0) {
+        return { status: 'cancelled' };
+      }
+
+      const generatedFiles = prepareGeneratedFiles({
+        template: templateConfig.template,
+        mappings: templateConfig.exportMappings,
+        orderedTargetFields: templateConfig.exportTargetFields,
+        inputFilePaths: selectionResult.filePaths,
+        selectedBigAccount
+      });
+
+      selectionResult.replacePaths.forEach((filePath) => {
+        removeStatementSessionEntriesByFilePath(session, filePath);
+      });
+
+      const batchId = appendStatementSessionImport(
+        session,
+        generatedFiles.fileEntries.map((entry) => buildStatementFileEntry(entry))
+      );
+
       rememberLastFileImportContext({
         templateId,
         template: templateConfig.template,
         mappings: templateConfig.exportMappings,
         orderedTargetFields: templateConfig.exportTargetFields,
-        inputFilePath,
-        selectedBigAccount
+        inputFilePaths: selectionResult.filePaths,
+        selectedBigAccount,
+        preparedDetailRows: generatedFiles.preparedBatch.detailRows,
+        scope: 'current',
+        statementSessionKey: session.key,
+        currentBatchId: batchId
       });
-      const generatedFiles = prepareGeneratedFiles({
-        template: templateConfig.template,
-        mappings: templateConfig.exportMappings,
-        orderedTargetFields: templateConfig.exportTargetFields,
-        inputFilePath,
-        selectedBigAccount
-      });
-      lastGeneratedExports = {
-        detail: generatedFiles.detail,
-        balance: generatedFiles.balance,
-        newAccount: lastGeneratedExports.newAccount
-      };
+      updateStatementSessionCache(session, batchId, generatedFiles);
       return buildImportResultFromGeneratedFiles({
         generatedFiles,
         templateId,
         templateName: templateConfig.template.name,
-        inputFilePath
+        inputFilePaths: selectionResult.filePaths
       });
     } catch (error) {
       clearGeneratedExports();
@@ -2914,7 +3619,7 @@ function registerFileHandlers() {
     }
   });
 
-  ipcMain.handle('file:complete-big-account-selection', (_event, payload = {}) => {
+  ipcMain.handle('file:complete-big-account-selection', async (_event, payload = {}) => {
     const pendingContext = lastPendingBigAccountSelection;
 
     if (!pendingContext) {
@@ -2945,33 +3650,55 @@ function registerFileHandlers() {
         merchantId: selectedOption.merchantId,
         currency: selectedOption.currency
       };
+      const session = getOrCreateStatementImportSession({
+        templateId: pendingContext.templateId,
+        templateName: pendingContext.template.name,
+        selectedBigAccount
+      });
+      const selectionResult = await resolveImportFileSelection({
+        templateName: pendingContext.template.name,
+        session,
+        filePaths: pendingContext.inputFilePaths
+      });
 
+      if (selectionResult.status === 'cancelled' || selectionResult.filePaths.length === 0) {
+        clearPendingBigAccountSelection();
+        return { status: 'cancelled' };
+      }
+
+      const generatedFiles = prepareGeneratedFiles({
+        template: pendingContext.template,
+        mappings: pendingContext.mappings,
+        orderedTargetFields: pendingContext.orderedTargetFields,
+        inputFilePaths: selectionResult.filePaths,
+        selectedBigAccount
+      });
+      selectionResult.replacePaths.forEach((filePath) => {
+        removeStatementSessionEntriesByFilePath(session, filePath);
+      });
+      const batchId = appendStatementSessionImport(
+        session,
+        generatedFiles.fileEntries.map((entry) => buildStatementFileEntry(entry))
+      );
       rememberLastFileImportContext({
         templateId: pendingContext.templateId,
         template: pendingContext.template,
         mappings: pendingContext.mappings,
         orderedTargetFields: pendingContext.orderedTargetFields,
-        inputFilePath: pendingContext.inputFilePath,
-        selectedBigAccount
-      });
-      const generatedFiles = prepareGeneratedFiles({
-        template: pendingContext.template,
-        mappings: pendingContext.mappings,
-        orderedTargetFields: pendingContext.orderedTargetFields,
-        inputFilePath: pendingContext.inputFilePath,
-        selectedBigAccount
+        inputFilePaths: selectionResult.filePaths,
+        selectedBigAccount,
+        preparedDetailRows: generatedFiles.preparedBatch.detailRows,
+        scope: 'current',
+        statementSessionKey: session.key,
+        currentBatchId: batchId
       });
       clearPendingBigAccountSelection();
-      lastGeneratedExports = {
-        detail: generatedFiles.detail,
-        balance: generatedFiles.balance,
-        newAccount: lastGeneratedExports.newAccount
-      };
+      updateStatementSessionCache(session, batchId, generatedFiles);
       return buildImportResultFromGeneratedFiles({
         generatedFiles,
         templateId: pendingContext.templateId,
         templateName: pendingContext.template.name,
-        inputFilePath: pendingContext.inputFilePath
+        inputFilePaths: selectionResult.filePaths
       });
     } catch (error) {
       clearGeneratedExports();
@@ -3090,24 +3817,25 @@ function registerFileHandlers() {
         ]
       });
 
-      const generatedFiles = prepareGeneratedFiles({
-        template: importContext.template,
-        mappings: importContext.mappings,
-        orderedTargetFields: importContext.orderedTargetFields,
-        inputFilePath: importContext.inputFilePath,
-        selectedBigAccount: importContext.selectedBigAccount
-      });
-      lastGeneratedExports = {
-        detail: generatedFiles.detail,
-        balance: generatedFiles.balance,
-        newAccount: lastGeneratedExports.newAccount
-      };
+      const generatedFiles = generateFilesFromRememberedContext(importContext);
+      const session = importContext.statementSessionKey
+        ? statementImportSessions.get(importContext.statementSessionKey) || null
+        : null;
+
+      if (importContext.scope === 'all') {
+        cacheAllStatementExport('balance', generatedFiles.balance);
+      } else if (session) {
+        updateStatementSessionCache(session, importContext.currentBatchId || session.currentBatchId, generatedFiles);
+      } else {
+        lastGeneratedExports.detail = generatedFiles.detail;
+        lastGeneratedExports.balance = generatedFiles.balance;
+      }
 
       return buildImportResultFromGeneratedFiles({
         generatedFiles,
         templateId: importContext.templateId,
         templateName: importContext.template.name,
-        inputFilePath: importContext.inputFilePath
+        inputFilePaths: importContext.inputFilePaths
       });
     } catch (error) {
       if (error instanceof FileValidationError) {
@@ -3143,12 +3871,12 @@ function registerFileHandlers() {
     }
   });
 
-  ipcMain.handle('file:export-detail', () => {
-    return exportGeneratedFile(lastGeneratedExports.detail, '暂无可导出的明细账单', '导出明细账单');
+  ipcMain.handle('file:export-detail', (_event, scope = 'auto') => {
+    return exportStatementByScope('detail', scope);
   });
 
-  ipcMain.handle('file:export-balance', () => {
-    return exportGeneratedFile(lastGeneratedExports.balance, '暂无可导出的余额账单', '导出余额账单');
+  ipcMain.handle('file:export-balance', (_event, scope = 'auto') => {
+    return exportStatementByScope('balance', scope);
   });
 }
 

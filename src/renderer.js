@@ -144,6 +144,14 @@ function setNewAccountStatus(message, tone = 'info', options = {}) {
   });
 }
 
+function applyManualBalancePromptStatus(result) {
+  setStatus(result.message, 'info', {
+    errorReportReady: Boolean(result.errorReportReady),
+    manualBalancePromptReady: Boolean(result.manualBalancePromptReady),
+    manualBalancePrompt: result.manualBalancePrompt || null
+  });
+}
+
 function getEnumStatusMessage() {
   return state.hasEnum
     ? `已加载内置枚举表：${state.enumFileName || 'COMMON枚举.xlsx'}`
@@ -810,6 +818,60 @@ function createConfirmDialog({ message, confirmText, cancelText, onConfirm }) {
     await onConfirm();
   });
   dialog.querySelector('[data-action="cancel"]').addEventListener('click', closeModal);
+  overlay.appendChild(dialog);
+  return overlay;
+}
+
+function createExportScopeDialog(kind) {
+  const overlay = createOverlay();
+  const dialog = document.createElement('div');
+  const fieldLabel = kind === 'detail' ? '明细' : '余额';
+  dialog.className = 'modal-card alert-card export-scope-card';
+  dialog.innerHTML = `
+    <div class="alert-message">请选择要导出的范围</div>
+    <div class="dialog-actions vertical">
+      <button class="secondary-btn small export-scope-btn" type="button" data-scope="current">导出当前文件的${fieldLabel}</button>
+      <button class="secondary-btn small export-scope-btn" type="button" data-scope="all">导出所有${fieldLabel}</button>
+    </div>
+  `;
+
+  async function runExport(scope) {
+    closeModal();
+    const result = kind === 'detail'
+      ? await window.desktopApi.files.exportDetail(scope)
+      : await window.desktopApi.files.exportBalance(scope);
+
+    if (result.status === 'cancelled') {
+      return;
+    }
+
+    if (result.status === 'select-export-scope') {
+      openModal(createExportScopeDialog(kind));
+      return;
+    }
+
+    if (kind === 'balance' && (result.manualBalancePromptReady || result.status === 'manual-balance-required')) {
+      applyManualBalancePromptStatus(result);
+      return;
+    }
+
+    setStatus(result.message, result.status === 'success' ? 'success' : 'error', {
+      errorReportReady: Boolean(result.errorReportReady)
+    });
+  }
+
+  dialog.querySelector('[data-scope="current"]').addEventListener('click', () => {
+    runExport('current').catch((error) => {
+      console.error(error);
+      setStatus(`导出${fieldLabel}账单失败，请查看控制台`, 'error');
+    });
+  });
+  dialog.querySelector('[data-scope="all"]').addEventListener('click', () => {
+    runExport('all').catch((error) => {
+      console.error(error);
+      setStatus(`导出${fieldLabel}账单失败，请查看控制台`, 'error');
+    });
+  });
   overlay.appendChild(dialog);
   return overlay;
 }
@@ -1936,6 +1998,11 @@ async function handleExportDetail() {
     return;
   }
 
+  if (result.status === 'select-export-scope') {
+    openModal(createExportScopeDialog('detail'));
+    return;
+  }
+
   setStatus(result.message, result.status === 'success' ? 'success' : 'error', {
     errorReportReady: Boolean(result.errorReportReady)
   });
@@ -1945,6 +2012,16 @@ async function handleExportBalance() {
   const result = await window.desktopApi.files.exportBalance();
 
   if (result.status === 'cancelled') {
+    return;
+  }
+
+  if (result.status === 'select-export-scope') {
+    openModal(createExportScopeDialog('balance'));
+    return;
+  }
+
+  if (result.manualBalancePromptReady || result.status === 'manual-balance-required') {
+    applyManualBalancePromptStatus(result);
     return;
   }
 

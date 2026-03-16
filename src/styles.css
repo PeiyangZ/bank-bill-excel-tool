@@ -964,10 +964,24 @@ select {
   margin-top: 18px;
 }
 
+.dialog-actions.vertical {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
 .dialog-actions.split {
   justify-content: space-between;
   align-items: center;
   margin-top: 18px;
+}
+
+.export-scope-card {
+  width: 320px;
+}
+
+.export-scope-btn {
+  width: 100%;
 }
 
 .template-manager-bundle-actions {

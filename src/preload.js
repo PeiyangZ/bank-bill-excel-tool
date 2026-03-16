@@ -38,8 +38,8 @@ contextBridge.exposeInMainWorld('desktopApi', {
     importFile: (templateId) => ipcRenderer.invoke('file:import', templateId),
     completeBigAccountSelection: (payload) => ipcRenderer.invoke('file:complete-big-account-selection', payload),
     saveBalanceSeed: (payload) => ipcRenderer.invoke('file:save-balance-seed', payload),
-    exportDetail: () => ipcRenderer.invoke('file:export-detail'),
-    exportBalance: () => ipcRenderer.invoke('file:export-balance')
+    exportDetail: (scope) => ipcRenderer.invoke('file:export-detail', scope),
+    exportBalance: (scope) => ipcRenderer.invoke('file:export-balance', scope)
   },
   newAccount: {
     generate: (payload) => ipcRenderer.invoke('new-account:generate', payload),
