@@ -571,7 +571,11 @@ function stripDateTimeSuffix(rawValue) {
   }
 
   const withoutIsoTime = normalizedValue.replace(/[Tt]\d{1,2}:\d{1,2}(:\d{1,2})?.*$/, '');
-  return withoutIsoTime.split(/\s+/)[0] || withoutIsoTime;
+  const withoutDashHourMinute = withoutIsoTime.replace(
+    /^(\d{4}-\d{1,2}-\d{1,2})-\d{1,2}:\d{1,2}$/,
+    '$1'
+  );
+  return withoutDashHourMinute.split(/\s+/)[0] || withoutDashHourMinute;
 }
 
 function buildNormalizedDateResult(date, displayFormat = 'yyyy-mm-dd', value = '') {

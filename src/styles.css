@@ -779,6 +779,79 @@ select {
   width: min(100%, 560px);
 }
 
+.manual-balance-context {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface-elevated) 78%, white 22%);
+}
+
+.manual-balance-progress {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-soft) 86%, white 14%);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.manual-balance-context-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.manual-balance-context-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.manual-balance-context-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.manual-balance-context-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.manual-balance-context-account {
+  display: block;
+}
+
+.manual-balance-context-tag {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 76%, white 24%);
+  border: 1px solid color-mix(in srgb, var(--border) 90%, transparent);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .manual-balance-form {
   display: grid;
   gap: 14px;
@@ -1142,6 +1215,11 @@ select {
 
   .manual-balance-row {
     grid-template-columns: 1fr;
+  }
+
+  .manual-balance-context-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
   }
 
   .export-actions {

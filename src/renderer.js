@@ -880,10 +880,32 @@ function createManualBalanceSeedDialog(prompt, draft = {}) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card manual-balance-card';
+  const queueIndex = Number.isInteger(prompt?.queueIndex) && prompt.queueIndex > 0 ? prompt.queueIndex : 1;
+  const queueTotal = Number.isInteger(prompt?.queueTotal) && prompt.queueTotal > 0 ? prompt.queueTotal : 1;
+  const merchantId = prompt?.merchantId || 'N/A';
+  const currency = prompt?.currency || '(空)';
+  const targetBillDate = prompt?.targetBillDate || 'N/A';
   dialog.innerHTML = `
     <div class="dialog-header">
       <div class="dialog-title">补录上一账单日余额</div>
       <button class="icon-close" type="button">×</button>
+    </div>
+    <div class="manual-balance-context">
+      <div class="manual-balance-progress">第 ${queueIndex} 个，共 ${queueTotal} 个</div>
+      <div class="manual-balance-context-grid">
+        <div class="manual-balance-context-row">
+          <span class="manual-balance-context-label">银行账号</span>
+          <span class="manual-balance-context-value manual-balance-context-account" title="${escapeHtml(merchantId)}">${escapeHtml(merchantId)}</span>
+        </div>
+        <div class="manual-balance-context-row">
+          <span class="manual-balance-context-label">币种</span>
+          <span class="manual-balance-context-tag" title="${escapeHtml(currency)}">${escapeHtml(currency)}</span>
+        </div>
+        <div class="manual-balance-context-row">
+          <span class="manual-balance-context-label">当前账单日期</span>
+          <span class="manual-balance-context-value" title="${escapeHtml(targetBillDate)}">${escapeHtml(targetBillDate)}</span>
+        </div>
+      </div>
     </div>
     <div class="manual-balance-form">
       <label class="manual-balance-row">

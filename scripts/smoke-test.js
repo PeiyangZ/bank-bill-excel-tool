@@ -276,6 +276,11 @@ function run() {
   });
   assert.strictEqual(normalizeDateExportValue('31-01-2026').value, '2026-01-31');
   assert.strictEqual(normalizeDateExportValue('1/2/26').value, '2026-02-01');
+  assert.deepStrictEqual(normalizeDateExportValue('2026-03-17-14:30'), {
+    value: '2026-03-17',
+    date: new Date(2026, 2, 17),
+    displayFormat: 'yyyy-mm-dd'
+  });
   assert.deepStrictEqual(normalizeDateExportValue('11/02/26 02:08:07'), {
     value: '2026-02-11',
     date: new Date(2026, 1, 11),

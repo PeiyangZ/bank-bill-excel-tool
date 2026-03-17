@@ -457,15 +457,22 @@ function rememberPendingBigAccountSelection(context = null) {
 
 function buildManualBalanceRequiredResult(prompt, generatedFiles) {
   clearLastErrorReport();
-  lastManualBalancePrompt = prompt ? { ...prompt } : null;
+  const normalizedPrompt = prompt
+    ? {
+        ...prompt,
+        queueIndex: Number.isInteger(prompt.queueIndex) && prompt.queueIndex > 0 ? prompt.queueIndex : 1,
+        queueTotal: Number.isInteger(prompt.queueTotal) && prompt.queueTotal > 0 ? prompt.queueTotal : 1
+      }
+    : null;
+  lastManualBalancePrompt = normalizedPrompt ? { ...normalizedPrompt } : null;
   appendActivityLogEntry({
     level: 'info',
     message: '等待补录上一账单日余额',
     details: [
-      `模板名：${prompt?.templateName || 'N/A'}`,
-      `银行账号：${prompt?.merchantId || 'N/A'}`,
-      `币种：${prompt?.currency || '(空)'}`,
-      `当前账单日期：${prompt?.targetBillDate || 'N/A'}`
+      `模板名：${normalizedPrompt?.templateName || 'N/A'}`,
+      `银行账号：${normalizedPrompt?.merchantId || 'N/A'}`,
+      `币种：${normalizedPrompt?.currency || '(空)'}`,
+      `当前账单日期：${normalizedPrompt?.targetBillDate || 'N/A'}`
     ]
   });
 
@@ -476,7 +483,7 @@ function buildManualBalanceRequiredResult(prompt, generatedFiles) {
     balanceReady: false,
     errorReportReady: false,
     manualBalancePromptReady: true,
-    manualBalancePrompt: prompt ? { ...prompt } : null
+    manualBalancePrompt: normalizedPrompt ? { ...normalizedPrompt } : null
   };
 }
 
