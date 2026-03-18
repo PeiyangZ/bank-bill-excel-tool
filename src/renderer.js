@@ -28,6 +28,23 @@ const MODULES = Object.freeze({
     name: '新开账户生成网银账单'
   }
 });
+const RENDERER_STARTUP_MARKS = Object.freeze({
+  scriptStart: 'renderer-script-start',
+  initializeStart: 'renderer-initialize-start',
+  getInfoStart: 'renderer-get-info-start',
+  getInfoDone: 'renderer-get-info-done',
+  initialUiReady: 'renderer-initial-ui-ready',
+  templatesRefreshStart: 'renderer-templates-refresh-start',
+  templatesRefreshDone: 'renderer-templates-refresh-done',
+  eventsBindStart: 'renderer-events-bind-start',
+  eventsBindDone: 'renderer-events-bind-done',
+  initComplete: 'renderer-init-complete'
+});
+const rendererStartupProfiler = {
+  startedAt: performance.now(),
+  marks: new Map()
+};
+rendererStartupProfiler.marks.set(RENDERER_STARTUP_MARKS.scriptStart, rendererStartupProfiler.startedAt);
 
 const state = {
   templates: [],
@@ -59,6 +76,48 @@ const state = {
     colorHex: DEFAULT_SPECTRUM_PICK_COLOR
   }
 };
+
+function markRendererStartup(stageName) {
+  rendererStartupProfiler.marks.set(stageName, performance.now());
+}
+
+function getRendererStartupValue(stageName) {
+  return rendererStartupProfiler.marks.get(stageName);
+}
+
+function buildRendererStartupMetrics() {
+  const marks = Object.fromEntries(
+    Array.from(rendererStartupProfiler.marks.entries()).map(([key, value]) => [key, Number((value - rendererStartupProfiler.startedAt).toFixed(3))])
+  );
+  const initializeStart = getRendererStartupValue(RENDERER_STARTUP_MARKS.initializeStart) ?? rendererStartupProfiler.startedAt;
+  const initComplete = getRendererStartupValue(RENDERER_STARTUP_MARKS.initComplete) ?? performance.now();
+  const getInfoStart = getRendererStartupValue(RENDERER_STARTUP_MARKS.getInfoStart) ?? initializeStart;
+  const getInfoDone = getRendererStartupValue(RENDERER_STARTUP_MARKS.getInfoDone) ?? getInfoStart;
+  const initialUiReady = getRendererStartupValue(RENDERER_STARTUP_MARKS.initialUiReady) ?? getInfoDone;
+  const templatesRefreshStart = getRendererStartupValue(RENDERER_STARTUP_MARKS.templatesRefreshStart) ?? initialUiReady;
+  const templatesRefreshDone = getRendererStartupValue(RENDERER_STARTUP_MARKS.templatesRefreshDone) ?? templatesRefreshStart;
+  const eventsBindStart = getRendererStartupValue(RENDERER_STARTUP_MARKS.eventsBindStart) ?? templatesRefreshDone;
+  const eventsBindDone = getRendererStartupValue(RENDERER_STARTUP_MARKS.eventsBindDone) ?? eventsBindStart;
+
+  return {
+    marks,
+    durations: {
+      totalInitMs: Number((initComplete - initializeStart).toFixed(3)),
+      getInfoMs: Number((getInfoDone - getInfoStart).toFixed(3)),
+      initialUiSetupMs: Number((initialUiReady - getInfoDone).toFixed(3)),
+      refreshTemplatesMs: Number((templatesRefreshDone - templatesRefreshStart).toFixed(3)),
+      bindEventsMs: Number((eventsBindDone - eventsBindStart).toFixed(3))
+    }
+  };
+}
+
+function reportRendererStartupMetrics() {
+  try {
+    window.desktopApi.app.reportStartupMetrics(buildRendererStartupMetrics());
+  } catch (error) {
+    console.error(error);
+  }
+}
 
 const elements = {
   appShell: document.getElementById('appShell'),
@@ -103,6 +162,70 @@ const elements = {
   backgroundDoneBtn: document.getElementById('backgroundDoneBtn'),
   backgroundResetBtn: document.getElementById('backgroundResetBtn')
 };
+
+const {
+  closeModal,
+  openModal,
+  createAlertDialog,
+  createConfirmDialog,
+  createExportScopeDialog,
+  createManualBalanceSeedDialog,
+  createTemplateRenameDialog,
+  createBigAccountSelectionDialog,
+  createBigAccountManagerDialog,
+  createTemplateManagerDialog,
+  createMappingDialog,
+  createAccountMappingDialog
+} = window.__rendererDialogs.createRendererDialogs({
+  state,
+  elements,
+  desktopApi: window.desktopApi,
+  BALANCE_DISABLED_OPTION,
+  BALANCE_CALCULATED_OPTION,
+  MERCHANT_ID_SELF_INPUT_OPTION,
+  ADVANCED_MAPPING_FIELDS,
+  refreshTemplates,
+  setStatus,
+  applyStatementResult,
+  applyManualBalancePromptStatus
+});
+
+const {
+  applyNewAccountPreviewState,
+  applyTemplateManagerPreviewState,
+  applyMappingDialogPreviewState,
+  applyTemplateRenamePreviewState,
+  applyBigAccountManagerPreviewState,
+  applyBigAccountManagerDropdownPreviewState,
+  applyBigAccountSelectionPreviewState
+} = window.__rendererPreviews.createRendererPreviews({
+  state,
+  elements,
+  MODULES,
+  ADVANCED_MAPPING_FIELDS,
+  BALANCE_CALCULATED_OPTION,
+  MERCHANT_ID_SELF_INPUT_OPTION,
+  SIGNED_AMOUNT_MAPPING_FIELD,
+  AMOUNT_BASED_NAME_MAPPING_FIELD,
+  AMOUNT_BASED_ACCOUNT_MAPPING_FIELD,
+  setCurrentModule,
+  syncNewAccountCurrencyMode,
+  updateNewAccountGenerateAvailability,
+  setNewAccountExportAvailability,
+  setNewAccountStatus,
+  setExportAvailability,
+  setStatus,
+  getNewAccountStatusTitle,
+  setNewAccountOpenDateValue,
+  openModal,
+  createTemplateManagerDialog,
+  createMappingDialog,
+  createTemplateRenameDialog,
+  createBigAccountManagerDialog,
+  createBigAccountSelectionDialog,
+  closeModal,
+  openBackgroundPalette
+});
 
 function updateStatusBox(box, message, tone = 'info', options = {}) {
   const {
@@ -769,22 +892,22 @@ function handleBackgroundReset() {
   );
 }
 
-function closeModal() {
+function legacyCloseModal() {
   elements.modalRoot.innerHTML = '';
 }
 
-function openModal(modalElement) {
+function legacyOpenModal(modalElement) {
   elements.modalRoot.innerHTML = '';
   elements.modalRoot.appendChild(modalElement);
 }
 
-function createOverlay() {
+function legacyCreateOverlay() {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   return overlay;
 }
 
-function createAlertDialog(message, options = {}) {
+function legacyCreateAlertDialog(message, options = {}) {
   const { onConfirm = null } = options;
   const overlay = createOverlay();
   const dialog = document.createElement('div');
@@ -803,7 +926,7 @@ function createAlertDialog(message, options = {}) {
   return overlay;
 }
 
-function createConfirmDialog({ message, confirmText, cancelText, onConfirm }) {
+function legacyCreateConfirmDialog({ message, confirmText, cancelText, onConfirm }) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card alert-card';
@@ -822,7 +945,7 @@ function createConfirmDialog({ message, confirmText, cancelText, onConfirm }) {
   return overlay;
 }
 
-function createExportScopeDialog(kind) {
+function legacyCreateExportScopeDialog(kind) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   const fieldLabel = kind === 'detail' ? '明细' : '余额';
@@ -876,7 +999,7 @@ function createExportScopeDialog(kind) {
   return overlay;
 }
 
-function createManualBalanceSeedDialog(prompt, draft = {}) {
+function legacyCreateManualBalanceSeedDialog(prompt, draft = {}) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card manual-balance-card';
@@ -979,7 +1102,7 @@ function createManualBalanceSeedDialog(prompt, draft = {}) {
   return overlay;
 }
 
-function escapeHtml(value) {
+function legacyEscapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
@@ -1018,7 +1141,7 @@ async function refreshTemplates() {
   updateTemplateSelect();
 }
 
-function cloneBigAccountItems(bigAccounts = []) {
+function legacyCloneBigAccountItems(bigAccounts = []) {
   return bigAccounts.map((item) => ({
     merchantId: String(item.merchantId || ''),
     currencies: Array.isArray(item.currencies) ? item.currencies.slice() : [],
@@ -1026,7 +1149,7 @@ function cloneBigAccountItems(bigAccounts = []) {
   }));
 }
 
-function formatBigAccountCurrencySummary(currencies) {
+function legacyFormatBigAccountCurrencySummary(currencies) {
   const uniqueCurrencies = Array.from(new Set((currencies || []).filter((value) => value)));
 
   if (!uniqueCurrencies.length) {
@@ -1044,11 +1167,11 @@ function formatBigAccountCurrencySummary(currencies) {
   return `${uniqueCurrencies.length}个币种`;
 }
 
-function getBigAccountCurrencyTitle(currencies) {
+function legacyGetBigAccountCurrencyTitle(currencies) {
   return Array.from(new Set((currencies || []).filter((value) => value))).join('、');
 }
 
-function collectMappingDraftFromTable(tableBody) {
+function legacyCollectMappingDraftFromTable(tableBody) {
   return Array.from(tableBody.querySelectorAll('tr[data-template-field]')).map((row) => {
     const select = row.querySelector('.mapping-select');
     const customInput = row.querySelector('.mapping-custom-input');
@@ -1063,7 +1186,7 @@ function collectMappingDraftFromTable(tableBody) {
   });
 }
 
-function createTemplateRenameDialog(template) {
+function legacyCreateTemplateRenameDialog(template) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card manual-balance-card';
@@ -1114,7 +1237,7 @@ function createTemplateRenameDialog(template) {
   return overlay;
 }
 
-function createBigAccountSelectionDialog(options) {
+function legacyCreateBigAccountSelectionDialog(options) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card manual-balance-card';
@@ -1169,7 +1292,7 @@ function createBigAccountSelectionDialog(options) {
   return overlay;
 }
 
-function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
+function legacyCreateBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card manager-card big-account-card';
@@ -1549,7 +1672,7 @@ function createBigAccountManagerDialog({ bigAccounts, onDone, onCancel }) {
   return overlay;
 }
 
-function renderTemplateTableRows(tableBody) {
+function legacyRenderTemplateTableRows(tableBody) {
   tableBody.innerHTML = '';
 
   if (!state.templates.length) {
@@ -1615,7 +1738,7 @@ function renderTemplateTableRows(tableBody) {
   });
 }
 
-function createTemplateManagerDialog() {
+function legacyCreateTemplateManagerDialog() {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card manager-card';
@@ -1681,7 +1804,7 @@ function createTemplateManagerDialog() {
   return overlay;
 }
 
-function createMappingDialog(payload) {
+function legacyCreateMappingDialog(payload) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   const advancedMappingFields = Array.isArray(payload.advancedMappingFields) && payload.advancedMappingFields.length
@@ -1852,7 +1975,7 @@ function createMappingDialog(payload) {
   return overlay;
 }
 
-function createAccountMappingDialog(payload) {
+function legacyCreateAccountMappingDialog(payload) {
   const overlay = createOverlay();
   const dialog = document.createElement('div');
   dialog.className = 'modal-card manager-card account-card';
@@ -2064,7 +2187,7 @@ function getNewAccountPayload() {
   };
 }
 
-function applyNewAccountPreviewState() {
+function legacyApplyNewAccountPreviewState() {
   setCurrentModule(MODULES.newAccountGenerator.id);
   elements.newAccountMultiCurrencyCheckbox.checked = false;
   state.selectedNewAccountCurrencies = [];
@@ -2082,7 +2205,7 @@ function applyNewAccountPreviewState() {
   });
 }
 
-function applyTemplateManagerPreviewState() {
+function legacyApplyTemplateManagerPreviewState() {
   setCurrentModule(MODULES.statementGenerator.id);
   state.templates = [
     {
@@ -2109,7 +2232,7 @@ function applyTemplateManagerPreviewState() {
   openModal(createTemplateManagerDialog());
 }
 
-function buildPreviewMappingPayload() {
+function legacyBuildPreviewMappingPayload() {
   return {
     template: {
       id: 'preview-template-4',
@@ -2173,13 +2296,13 @@ function buildPreviewMappingPayload() {
   };
 }
 
-function applyMappingDialogPreviewState() {
+function legacyApplyMappingDialogPreviewState() {
   setCurrentModule(MODULES.statementGenerator.id);
   state.currencyOptions = ['USD', 'HKD', 'CNY', 'EUR', 'JPY'];
   openModal(createMappingDialog(buildPreviewMappingPayload()));
 }
 
-function applyTemplateRenamePreviewState() {
+function legacyApplyTemplateRenamePreviewState() {
   setCurrentModule(MODULES.statementGenerator.id);
   openModal(createTemplateRenameDialog({
     id: 'preview-template-2',
@@ -2187,7 +2310,7 @@ function applyTemplateRenamePreviewState() {
   }));
 }
 
-function applyBigAccountManagerPreviewState() {
+function legacyApplyBigAccountManagerPreviewState() {
   setCurrentModule(MODULES.statementGenerator.id);
   state.currencyOptions = ['USD', 'HKD', 'CNY', 'EUR', 'JPY'];
   openModal(createBigAccountManagerDialog({
@@ -2234,7 +2357,7 @@ function applyBigAccountManagerPreviewState() {
   }, 40);
 }
 
-function applyBigAccountManagerDropdownPreviewState() {
+function legacyApplyBigAccountManagerDropdownPreviewState() {
   applyBigAccountManagerPreviewState();
 
   setTimeout(() => {
@@ -2250,7 +2373,7 @@ function applyBigAccountManagerDropdownPreviewState() {
   }, 160);
 }
 
-function applyBigAccountSelectionPreviewState() {
+function legacyApplyBigAccountSelectionPreviewState() {
   setCurrentModule(MODULES.statementGenerator.id);
   openModal(createBigAccountSelectionDialog([
     {
@@ -2311,7 +2434,10 @@ async function handleNewAccountExport() {
 }
 
 async function initialize() {
+  markRendererStartup(RENDERER_STARTUP_MARKS.initializeStart);
+  markRendererStartup(RENDERER_STARTUP_MARKS.getInfoStart);
   const info = await window.desktopApi.app.getInfo();
+  markRendererStartup(RENDERER_STARTUP_MARKS.getInfoDone);
   drawBackgroundSpectrum();
   resetBackgroundPickerSelection();
   elements.appVersion.textContent = info.version;
@@ -2328,7 +2454,10 @@ async function initialize() {
   renderNewAccountCurrencyOptions();
   setNewAccountOpenDateValue('');
   syncNewAccountCurrencyMode();
+  markRendererStartup(RENDERER_STARTUP_MARKS.initialUiReady);
+  markRendererStartup(RENDERER_STARTUP_MARKS.templatesRefreshStart);
   await refreshTemplates();
+  markRendererStartup(RENDERER_STARTUP_MARKS.templatesRefreshDone);
   setExportAvailability({
     detailEnabled: false,
     balanceEnabled: false
@@ -2345,6 +2474,7 @@ async function initialize() {
     idleTitle: getNewAccountStatusTitle()
   });
 
+  markRendererStartup(RENDERER_STARTUP_MARKS.eventsBindStart);
   elements.importTemplateBtn.addEventListener('click', handleImportTemplate);
   elements.manageTemplateBtn.addEventListener('click', () => {
     openModal(createTemplateManagerDialog());
@@ -2522,6 +2652,7 @@ async function initialize() {
       }
     }
   });
+  markRendererStartup(RENDERER_STARTUP_MARKS.eventsBindDone);
 
   if (info.previewModal === 'account-mapping') {
     setTimeout(() => {
@@ -2567,6 +2698,9 @@ async function initialize() {
       openBackgroundPalette();
     }, 120);
   }
+
+  markRendererStartup(RENDERER_STARTUP_MARKS.initComplete);
+  reportRendererStartupMetrics();
 }
 
 initialize().catch((error) => {

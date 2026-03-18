@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 const { app, BrowserWindow, dialog, ipcMain, nativeImage } = require('electron');
 const { AppDatabase } = require('./backend/database');
 const {
@@ -33,6 +34,20 @@ const {
 const {
   reportStartupFailure
 } = require('./backend/startup-failure');
+const {
+  appendStatementSessionImport,
+  buildStatementFileEntry,
+  cloneRowsWithMetadata,
+  getOrCreateStatementImportSession,
+  getStatementSessionEntries,
+  mergeMappedDetailRows,
+  normalizeInputFilePaths,
+  removeStatementSessionEntriesByFilePath,
+  resolveSinglePreparedFieldValue
+} = require('./main-process/statement-session');
+const {
+  createStatementGenerationHelpers
+} = require('./main-process/statement-generation');
 
 if (process.env.APP_USER_DATA_DIR) {
   app.setPath('userData', process.env.APP_USER_DATA_DIR);
@@ -65,6 +80,7 @@ let lastPendingBigAccountSelection = null;
 let statementImportSessions = new Map();
 let nextStatementBatchId = 1;
 let nextStatementFileEntryId = 1;
+let startupMetricsReported = false;
 
 const DEFAULT_BACKGROUND_COLOR = '#efe8da';
 const BUNDLED_ENUM_FILE_NAME = 'COMMON枚举.xlsx';
@@ -93,6 +109,24 @@ const BACKGROUND_IMAGE_LIMITS = Object.freeze({
 });
 const SUPPORTED_BACKGROUND_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const APP_ICON_FILE_NAMES = ['app-icon.ico', 'app-icon.png'];
+const STARTUP_METRIC_MARKS = Object.freeze({
+  processStart: 'process-start',
+  appReady: 'app-when-ready',
+  activityLogReady: 'activity-log-initialized',
+  databaseReady: 'database-init-done',
+  templateLibrarySynced: 'template-library-sync-done',
+  handlersReady: 'handlers-registered',
+  windowCreated: 'window-created',
+  loadStarted: 'load-file-called',
+  didFinishLoad: 'did-finish-load',
+  readyToShow: 'ready-to-show'
+});
+const startupMetrics = {
+  startedAt: performance.now(),
+  marks: new Map(),
+  renderer: null
+};
+startupMetrics.marks.set(STARTUP_METRIC_MARKS.processStart, startupMetrics.startedAt);
 
 function pad(value) {
   return String(value).padStart(2, '0');
@@ -105,110 +139,104 @@ function sanitizeFileName(value) {
     .trim();
 }
 
-function cloneRowsWithMetadata(rows = []) {
-  const clonedRows = Array.isArray(rows)
-    ? rows.map((row) => (Array.isArray(row) ? row.slice() : row))
-    : [];
-
-  if (Array.isArray(rows.rowMetas)) {
-    clonedRows.rowMetas = rows.rowMetas.map((meta) => (meta ? { ...meta } : meta));
-  }
-
-  if (Array.isArray(rows.issues)) {
-    clonedRows.issues = rows.issues.map((issue) => ({ ...issue }));
-  }
-
-  if (Array.isArray(rows.skippedRows)) {
-    clonedRows.skippedRows = rows.skippedRows.map((row) => ({ ...row }));
-  }
-
-  if (Array.isArray(rows.simultaneousRows)) {
-    clonedRows.simultaneousRows = rows.simultaneousRows.map((row) => ({ ...row }));
-  }
-
-  if (Array.isArray(rows.sourceRows)) {
-    clonedRows.sourceRows = cloneRowsWithMetadata(rows.sourceRows);
-  }
-
-  return clonedRows;
+function markStartupMetric(stageName) {
+  startupMetrics.marks.set(stageName, performance.now());
 }
 
-function normalizeInputFilePaths(inputFilePathOrPaths, { dedupe = true } = {}) {
-  const normalizedPaths = (Array.isArray(inputFilePathOrPaths) ? inputFilePathOrPaths : [inputFilePathOrPaths])
-    .map((filePath) => String(filePath || '').trim())
-    .filter((filePath) => filePath !== '')
-    .map((filePath) => path.resolve(filePath));
-
-  return dedupe ? Array.from(new Set(normalizedPaths)) : normalizedPaths;
+function getStartupMetricValue(stageName) {
+  return startupMetrics.marks.get(stageName);
 }
 
-function getStatementSessionKey({ templateId }) {
-  return String(templateId || '');
+function formatStartupDuration(milliseconds) {
+  return `${milliseconds.toFixed(1)}ms`;
 }
 
-function createStatementImportSession({ templateId, templateName }) {
+function buildStartupMetricsSnapshot() {
+  const marks = Object.fromEntries(
+    Array.from(startupMetrics.marks.entries()).map(([key, value]) => [key, Number((value - startupMetrics.startedAt).toFixed(3))])
+  );
+  const totalReadyToShow = getStartupMetricValue(STARTUP_METRIC_MARKS.readyToShow) - startupMetrics.startedAt;
+  const createWindowToReady = getStartupMetricValue(STARTUP_METRIC_MARKS.readyToShow) - getStartupMetricValue(STARTUP_METRIC_MARKS.windowCreated);
+  const loadToReady = getStartupMetricValue(STARTUP_METRIC_MARKS.readyToShow) - getStartupMetricValue(STARTUP_METRIC_MARKS.loadStarted);
+  const loadToFinish = getStartupMetricValue(STARTUP_METRIC_MARKS.didFinishLoad) - getStartupMetricValue(STARTUP_METRIC_MARKS.loadStarted);
+
   return {
-    key: getStatementSessionKey({ templateId }),
-    templateId,
-    templateName,
-    importCount: 0,
-    currentBatchId: '',
-    fileEntries: [],
-    batches: []
+    marks,
+    durations: {
+      totalReadyToShowMs: Number(totalReadyToShow.toFixed(3)),
+      createWindowToReadyMs: Number(createWindowToReady.toFixed(3)),
+      loadToReadyMs: Number(loadToReady.toFixed(3)),
+      loadToDidFinishMs: Number(loadToFinish.toFixed(3))
+    },
+    renderer: startupMetrics.renderer
   };
 }
 
-function getOrCreateStatementImportSession({ templateId, templateName }) {
-  const sessionKey = getStatementSessionKey({ templateId });
+function writeStartupMetricsSnapshot(snapshot) {
+  const targetPath = String(process.env.APP_STARTUP_METRICS_PATH || '').trim();
 
-  if (!statementImportSessions.has(sessionKey)) {
-    statementImportSessions.set(
-      sessionKey,
-      createStatementImportSession({ templateId, templateName })
-    );
-  }
-
-  return statementImportSessions.get(sessionKey);
-}
-
-function clearStatementExportCache(sessionKey = '') {
-  if (!sessionKey || lastGeneratedExports.statementSessionKey !== sessionKey) {
+  if (!targetPath) {
     return;
   }
 
-  lastGeneratedExports.allDetail = null;
-  lastGeneratedExports.allBalance = null;
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(`${targetPath}`, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
 }
 
-function pruneStatementImportSession(session) {
-  session.batches = session.batches
-    .map((batch) => ({
-      ...batch,
-      entryIds: batch.entryIds.filter((entryId) => session.fileEntries.some((entry) => entry.id === entryId))
-    }))
-    .filter((batch) => batch.entryIds.length > 0);
-
-  if (!session.batches.some((batch) => batch.id === session.currentBatchId)) {
-    session.currentBatchId = session.batches[session.batches.length - 1]?.id || '';
-  }
-}
-
-function removeStatementSessionEntriesByFilePath(session, targetFilePath) {
-  const normalizedPath = path.resolve(targetFilePath);
-  const removedEntryIds = session.fileEntries
-    .filter((entry) => entry.filePath === normalizedPath)
-    .map((entry) => entry.id);
-
-  if (!removedEntryIds.length) {
+function reportStartupMetrics() {
+  if (startupMetricsReported) {
     return;
   }
 
-  session.fileEntries = session.fileEntries.filter((entry) => entry.filePath !== normalizedPath);
-  session.batches = session.batches.map((batch) => ({
-    ...batch,
-    entryIds: batch.entryIds.filter((entryId) => !removedEntryIds.includes(entryId))
-  }));
-  pruneStatementImportSession(session);
+  const readyToShowValue = getStartupMetricValue(STARTUP_METRIC_MARKS.readyToShow);
+  const windowCreatedValue = getStartupMetricValue(STARTUP_METRIC_MARKS.windowCreated);
+  const loadStartedValue = getStartupMetricValue(STARTUP_METRIC_MARKS.loadStarted);
+  const didFinishLoadValue = getStartupMetricValue(STARTUP_METRIC_MARKS.didFinishLoad);
+
+  if (
+    readyToShowValue === undefined ||
+    windowCreatedValue === undefined ||
+    loadStartedValue === undefined ||
+    didFinishLoadValue === undefined
+  ) {
+    return;
+  }
+
+  startupMetricsReported = true;
+  const snapshot = buildStartupMetricsSnapshot();
+  appendActivityLogEntry({
+    level: 'info',
+    message: '启动耗时',
+    details: [
+      `进程启动到可见：${formatStartupDuration(snapshot.durations.totalReadyToShowMs)}`,
+      `建窗到可见：${formatStartupDuration(snapshot.durations.createWindowToReadyMs)}`,
+      `loadFile 到 did-finish-load：${formatStartupDuration(snapshot.durations.loadToDidFinishMs)}`,
+      `loadFile 到 ready-to-show：${formatStartupDuration(snapshot.durations.loadToReadyMs)}`
+    ]
+  });
+  writeStartupMetricsSnapshot(snapshot);
+}
+
+function sanitizeRendererStartupMetrics(payload = {}) {
+  const marks = payload && typeof payload.marks === 'object' && payload.marks !== null
+    ? Object.fromEntries(
+        Object.entries(payload.marks)
+          .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+          .map(([key, value]) => [key, Number(value.toFixed(3))])
+      )
+    : {};
+  const durations = payload && typeof payload.durations === 'object' && payload.durations !== null
+    ? Object.fromEntries(
+        Object.entries(payload.durations)
+          .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+          .map(([key, value]) => [key, Number(value.toFixed(3))])
+      )
+    : {};
+
+  return {
+    marks,
+    durations
+  };
 }
 
 function buildStatementBatchId() {
@@ -221,92 +249,6 @@ function buildStatementFileEntryId() {
   const entryId = `entry-${nextStatementFileEntryId}`;
   nextStatementFileEntryId += 1;
   return entryId;
-}
-
-function buildStatementFileEntry({ filePath, detailRows }) {
-  return {
-    id: buildStatementFileEntryId(),
-    filePath: path.resolve(filePath),
-    detailRows: cloneRowsWithMetadata(detailRows)
-  };
-}
-
-function getStatementSessionEntries(session, scope = 'all') {
-  if (!session) {
-    return [];
-  }
-
-  if (scope === 'current') {
-    const currentBatch = session.batches.find((batch) => batch.id === session.currentBatchId);
-
-    if (!currentBatch) {
-      return [];
-    }
-
-    return currentBatch.entryIds
-      .map((entryId) => session.fileEntries.find((entry) => entry.id === entryId))
-      .filter(Boolean);
-  }
-
-  return session.fileEntries.slice();
-}
-
-function mergeMappedDetailRows(mappedRowsList = []) {
-  const nonEmptyRows = mappedRowsList.filter((rows) => Array.isArray(rows) && rows.length > 0);
-
-  if (!nonEmptyRows.length) {
-    return [];
-  }
-
-  const mergedRows = [Array.isArray(nonEmptyRows[0][0]) ? nonEmptyRows[0][0].slice() : []];
-  const mergedRowMetas = [];
-  const mergedIssues = [];
-
-  nonEmptyRows.forEach((rows) => {
-    rows.slice(1).forEach((row) => {
-      mergedRows.push(Array.isArray(row) ? row.slice() : row);
-    });
-
-    if (Array.isArray(rows.rowMetas)) {
-      rows.rowMetas.forEach((meta) => {
-        mergedRowMetas.push(meta ? { ...meta } : meta);
-      });
-    }
-
-    if (Array.isArray(rows.issues)) {
-      rows.issues.forEach((issue) => {
-        mergedIssues.push({ ...issue });
-      });
-    }
-  });
-
-  mergedRows.rowMetas = mergedRowMetas;
-  mergedRows.issues = mergedIssues;
-  return mergedRows;
-}
-
-function resolveSinglePreparedFieldValue(detailRows, fieldName) {
-  if (!Array.isArray(detailRows) || detailRows.length <= 1) {
-    return '';
-  }
-
-  const fieldIndexMap = buildFieldIndexMap(detailRows[0] || []);
-  const fieldIndex = fieldIndexMap.get(normalizeCell(fieldName));
-
-  if (fieldIndex === undefined) {
-    return '';
-  }
-
-  const uniqueValues = Array.from(
-    new Set(
-      detailRows
-        .slice(1)
-        .map((row) => normalizeCell(Array.isArray(row) ? row[fieldIndex] : ''))
-        .filter((value) => value !== '')
-    )
-  );
-
-  return uniqueValues.length === 1 ? uniqueValues[0] : '';
 }
 
 function getAppRootDirectory() {
@@ -341,6 +283,7 @@ function initializeActivityLog() {
   }
 
   activityLogFilePath = ensureActivityLogFile(getActivityLogFallbackFilePath());
+  markStartupMetric(STARTUP_METRIC_MARKS.activityLogReady);
 
   appendActivityLogEntry({
     level: 'info',
@@ -1746,13 +1689,20 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js')
     }
   });
+  markStartupMetric(STARTUP_METRIC_MARKS.windowCreated);
 
   if (windowIcon && process.platform !== 'darwin') {
     mainWindow.setIcon(windowIcon);
   }
 
+  mainWindow.webContents.once('did-finish-load', () => {
+    markStartupMetric(STARTUP_METRIC_MARKS.didFinishLoad);
+  });
+  markStartupMetric(STARTUP_METRIC_MARKS.loadStarted);
   mainWindow.loadFile(path.join(app.getAppPath(), 'index.html'));
   mainWindow.once('ready-to-show', () => {
+    markStartupMetric(STARTUP_METRIC_MARKS.readyToShow);
+    reportStartupMetrics();
     mainWindow.show();
     sendWindowState();
 
@@ -1823,6 +1773,31 @@ function registerAppHandlers() {
       backgroundConfig: buildBackgroundPayload(),
       previewModal: process.env.APP_PREVIEW_MODAL || ''
     };
+  });
+  ipcMain.on('app:report-startup-metrics', (_event, payload = {}) => {
+    startupMetrics.renderer = sanitizeRendererStartupMetrics(payload);
+
+    const totalInitMs = startupMetrics.renderer?.durations?.totalInitMs;
+    const getInfoMs = startupMetrics.renderer?.durations?.getInfoMs;
+    const refreshTemplatesMs = startupMetrics.renderer?.durations?.refreshTemplatesMs;
+    const bindEventsMs = startupMetrics.renderer?.durations?.bindEventsMs;
+
+    if (totalInitMs !== undefined) {
+      appendActivityLogEntry({
+        level: 'info',
+        message: '渲染层启动耗时',
+        details: [
+          `初始化总耗时：${formatStartupDuration(totalInitMs)}`,
+          ...(getInfoMs !== undefined ? [`app:get-info：${formatStartupDuration(getInfoMs)}`] : []),
+          ...(refreshTemplatesMs !== undefined ? [`模板刷新：${formatStartupDuration(refreshTemplatesMs)}`] : []),
+          ...(bindEventsMs !== undefined ? [`事件绑定：${formatStartupDuration(bindEventsMs)}`] : [])
+        ]
+      });
+    }
+
+    if (startupMetricsReported) {
+      writeStartupMetricsSnapshot(buildStartupMetricsSnapshot());
+    }
   });
 }
 
@@ -2784,38 +2759,45 @@ function buildMappedRowsForFile({
   });
 }
 
-function buildPreparedStatementBatchFromEntries({ config, fileEntries = [] }) {
-  const detailRows = mergeMappedDetailRows(fileEntries.map((entry) => entry.detailRows));
-  const selectedMerchantId = config.selectedMerchantId || resolveSinglePreparedFieldValue(detailRows, 'MerchantId');
-  const selectedCurrency = config.selectedCurrency || resolveSinglePreparedFieldValue(detailRows, 'Currency');
+const statementGenerationHelpers = createStatementGenerationHelpers({
+  appendActivityLogEntry,
+  appendLog,
+  buildDateRangeLabel,
+  buildFieldIndexMap,
+  buildImportWarningDetailLines,
+  buildImportWarningMessage,
+  buildManualBalanceRequiredResult,
+  buildMappedRowsForFile,
+  buildStatementGenerationConfig,
+  buildStatementOutputFilePath,
+  cloneRowsWithMetadata,
+  createErrorResult,
+  createWarningResult,
+  deriveBalanceRecords,
+  ensureStorageRoot,
+  extractHeaders,
+  FileValidationError,
+  findPreviousBalanceSeed,
+  generateStatementFiles,
+  getBalanceTemplatePath,
+  getStatementSessionEntries,
+  mergeMappedDetailRows,
+  normalizeCell,
+  normalizeInputFilePaths,
+  parseRequiredBillDates,
+  resolveSinglePreparedFieldValue,
+  splitTemplateName,
+  storeGeneratedBalanceSeeds,
+  writeBalanceWorkbook,
+  writeWorkbookRows
+});
 
-  return {
-    detailRows,
-    warnings: Array.isArray(detailRows.issues) ? detailRows.issues.slice() : [],
-    balanceRequested: Boolean(config.balanceRequested),
-    balanceMode: config.balanceMode,
-    selectedMerchantId,
-    selectedCurrency,
-    inputFilePaths: fileEntries.map((entry) => entry.filePath)
-  };
+function buildPreparedStatementBatchFromEntries({ config, fileEntries = [] }) {
+  return statementGenerationHelpers.buildPreparedStatementBatchFromEntries({ config, fileEntries });
 }
 
 function buildPreparedStatementBatchFromFilePaths({ config, inputFilePaths = [] }) {
-  const fileEntries = normalizeInputFilePaths(inputFilePaths, { dedupe: false }).map((inputFilePath) => ({
-    filePath: inputFilePath,
-    detailRows: buildMappedRowsForFile({
-      config,
-      inputFilePath
-    })
-  }));
-
-  return {
-    fileEntries,
-    preparedBatch: buildPreparedStatementBatchFromEntries({
-      config,
-      fileEntries
-    })
-  };
+  return statementGenerationHelpers.buildPreparedStatementBatchFromFilePaths({ config, inputFilePaths });
 }
 
 function generateStatementFiles({
@@ -3003,26 +2985,15 @@ function prepareGeneratedFiles({
   selectedBigAccount = null,
   scope = 'current'
 }) {
-  const config = buildStatementGenerationConfig({
+  return statementGenerationHelpers.prepareGeneratedFiles({
     template,
     mappings,
     orderedTargetFields,
-    selectedBigAccount
+    inputFilePath,
+    inputFilePaths,
+    selectedBigAccount,
+    scope
   });
-  const prepared = buildPreparedStatementBatchFromFilePaths({
-    config,
-    inputFilePaths: inputFilePaths || inputFilePath
-  });
-
-  return {
-    ...generateStatementFiles({
-      config,
-      preparedBatch: prepared.preparedBatch,
-      scope
-    }),
-    fileEntries: prepared.fileEntries,
-    preparedBatch: prepared.preparedBatch
-  };
 }
 
 async function exportGeneratedFile(generatedFile, emptyMessage, step) {
@@ -3082,7 +3053,7 @@ async function exportGeneratedFile(generatedFile, emptyMessage, step) {
 }
 
 function extractManualBalancePromptWarning(warnings = []) {
-  return warnings.find((warning) => warning.type === 'balance-seed-required') || null;
+  return statementGenerationHelpers.extractManualBalancePromptWarning(warnings);
 }
 
 function buildImportResultFromGeneratedFiles({
@@ -3092,78 +3063,13 @@ function buildImportResultFromGeneratedFiles({
   inputFilePath,
   inputFilePaths
 }) {
-  const manualBalanceWarning = extractManualBalancePromptWarning(generatedFiles.warnings);
-  const normalizedInputFilePaths = normalizeInputFilePaths(inputFilePaths || inputFilePath);
-
-  if (manualBalanceWarning) {
-    return buildManualBalanceRequiredResult(manualBalanceWarning.prompt, generatedFiles);
-  }
-
-  if (generatedFiles.warnings.length) {
-    clearPendingManualBalancePrompt();
-    const detailReady = Boolean(generatedFiles.detail);
-    const balanceReady = Boolean(generatedFiles.balance);
-    const message = buildImportWarningMessage({
-      warnings: generatedFiles.warnings,
-      balanceReady,
-      balanceRequested: generatedFiles.balanceRequested
-    });
-
-    return createWarningResult({
-      step: '导入网银明细文件',
-      message,
-      detailReady,
-      balanceReady,
-      detailLines: buildImportWarningDetailLines(generatedFiles.warnings),
-      context: {
-        templateId,
-        inputFilePath,
-        templateName
-      },
-      errorCode: 'FILE_IMPORT_WARNING',
-      templateName
-    });
-  }
-
-  clearPendingManualBalancePrompt();
-  clearLastErrorReport();
-  appendActivityLogEntry({
-    level: 'info',
-    message: '导入网银明细文件成功',
-    details: [
-      `模板名：${templateName}`,
-      normalizedInputFilePaths.length > 1
-        ? `源文件：${normalizedInputFilePaths.join('；')}`
-        : `源文件：${normalizedInputFilePaths[0] || inputFilePath || ''}`,
-      generatedFiles.balance ? '已生成余额账单' : '仅生成明细账单'
-    ]
+  return statementGenerationHelpers.buildImportResultFromGeneratedFiles({
+    generatedFiles,
+    templateId,
+    templateName,
+    inputFilePath,
+    inputFilePaths
   });
-
-  return {
-    status: 'success',
-    message: generatedFiles.message,
-    detailReady: Boolean(generatedFiles.detail),
-    balanceReady: Boolean(generatedFiles.balance)
-  };
-}
-
-function appendStatementSessionImport(session, fileEntries = []) {
-  const batchId = buildStatementBatchId();
-  const normalizedEntries = fileEntries.map((entry) => ({
-    ...entry,
-    detailRows: cloneRowsWithMetadata(entry.detailRows)
-  }));
-
-  session.importCount += 1;
-  session.currentBatchId = batchId;
-  session.fileEntries.push(...normalizedEntries);
-  session.batches.push({
-    id: batchId,
-    entryIds: normalizedEntries.map((entry) => entry.id),
-    importedAt: new Date().toISOString()
-  });
-  clearStatementExportCache(session.key);
-  return batchId;
 }
 
 function buildPreparedBatchFromStatementSession({
@@ -3171,9 +3077,10 @@ function buildPreparedBatchFromStatementSession({
   config,
   scope = 'all'
 }) {
-  return buildPreparedStatementBatchFromEntries({
+  return statementGenerationHelpers.buildPreparedBatchFromStatementSession({
+    session,
     config,
-    fileEntries: getStatementSessionEntries(session, scope)
+    scope
   });
 }
 
@@ -3242,20 +3149,7 @@ async function resolveImportFileSelection({
 }
 
 function buildScopeSelectionResult(kind) {
-  return {
-    status: 'select-export-scope',
-    kind,
-    options: [
-      {
-        scope: 'current',
-        label: `导出当前文件的${kind === 'detail' ? '明细' : '余额'}`
-      },
-      {
-        scope: 'all',
-        label: `导出所有${kind === 'detail' ? '明细' : '余额'}`
-      }
-    ]
-  };
+  return statementGenerationHelpers.buildScopeSelectionResult(kind);
 }
 
 function getCurrentStatementSession() {
@@ -3279,82 +3173,41 @@ function createGenerationContext({
   statementSessionKey = '',
   currentBatchId = ''
 }) {
-  return {
+  return statementGenerationHelpers.createGenerationContext({
     templateId,
     template,
     mappings,
     orderedTargetFields,
-    inputFilePaths: normalizeInputFilePaths(inputFilePaths),
+    inputFilePaths,
     selectedBigAccount,
-    preparedDetailRows: preparedDetailRows ? cloneRowsWithMetadata(preparedDetailRows) : null,
+    preparedDetailRows,
     scope,
     statementSessionKey,
     currentBatchId
-  };
+  });
 }
 
 function generateFilesFromRememberedContext(context) {
-  if (!context) {
-    throw new FileValidationError('FILE_READ', '当前没有可重新生成的导入上下文，请重新导入文件');
-  }
-
-  const config = buildStatementGenerationConfig({
-    template: context.template,
-    mappings: context.mappings,
-    orderedTargetFields: context.orderedTargetFields,
-    selectedBigAccount: context.selectedBigAccount,
-    allowManagedMerchantWithoutSelection: Boolean(context.preparedDetailRows)
-  });
-  const preparedBatch = context.preparedDetailRows
-    ? buildPreparedStatementBatchFromEntries({
-        config,
-        fileEntries: [{
-          id: 'cached-context',
-          filePath: '__cached__',
-          detailRows: context.preparedDetailRows
-        }]
-      })
-    : buildPreparedStatementBatchFromFilePaths({
-        config,
-        inputFilePaths: context.inputFilePaths
-      }).preparedBatch;
-
-  return generateStatementFiles({
-    config,
-    preparedBatch,
-    scope: context.scope || 'current'
-  });
+  return statementGenerationHelpers.generateFilesFromRememberedContext(context);
 }
 
 function cacheCurrentStatementExports({
   session,
   generatedFiles
 }) {
-  lastGeneratedExports.detail = generatedFiles.detail;
-  lastGeneratedExports.balance = generatedFiles.balance;
-  lastGeneratedExports.allDetail = null;
-  lastGeneratedExports.allBalance = null;
-  lastGeneratedExports.statementSessionKey = session?.key || '';
-  lastGeneratedExports.currentBatchId = session?.currentBatchId || '';
+  statementGenerationHelpers.cacheCurrentStatementExports({
+    session,
+    generatedFiles,
+    lastGeneratedExports
+  });
 }
 
 function cacheAllStatementExport(kind, generatedFile) {
-  if (kind === 'detail') {
-    lastGeneratedExports.allDetail = generatedFile;
-    return;
-  }
-
-  if (kind === 'balance') {
-    lastGeneratedExports.allBalance = generatedFile;
-  }
+  statementGenerationHelpers.cacheAllStatementExport(lastGeneratedExports, kind, generatedFile);
 }
 
 function updateStatementSessionCache(session, batchId, generatedFiles) {
-  session.currentBatchId = batchId;
-  cacheCurrentStatementExports({
-    session,
-    generatedFiles
-  });
+  statementGenerationHelpers.updateStatementSessionCache(session, batchId, generatedFiles, lastGeneratedExports);
 }
 
 function buildStatementSessionGenerationContext({
@@ -3364,30 +3217,17 @@ function buildStatementSessionGenerationContext({
   orderedTargetFields,
   scope
 }) {
-  const config = buildStatementGenerationConfig({
+  return statementGenerationHelpers.buildStatementSessionGenerationContext({
+    session,
     template,
     mappings,
     orderedTargetFields,
-    allowManagedMerchantWithoutSelection: true
-  });
-  const preparedBatch = buildPreparedBatchFromStatementSession({
-    session,
-    config,
     scope
   });
-
-  return {
-    config,
-    preparedBatch
-  };
 }
 
 function getGeneratedStatementExport(kind, scope = 'current') {
-  if (scope === 'all') {
-    return kind === 'detail' ? lastGeneratedExports.allDetail : lastGeneratedExports.allBalance;
-  }
-
-  return kind === 'detail' ? lastGeneratedExports.detail : lastGeneratedExports.balance;
+  return statementGenerationHelpers.getGeneratedStatementExport(lastGeneratedExports, kind, scope);
 }
 
 async function exportStatementByScope(kind, scope = 'auto') {
@@ -3554,6 +3394,7 @@ function registerFileHandlers() {
         : null;
 
       const session = getOrCreateStatementImportSession({
+        statementImportSessions,
         templateId,
         templateName: templateConfig.template.name
       });
@@ -3579,10 +3420,15 @@ function registerFileHandlers() {
         removeStatementSessionEntriesByFilePath(session, filePath);
       });
 
-      const batchId = appendStatementSessionImport(
+      const batchId = appendStatementSessionImport({
+        buildBatchId: buildStatementBatchId,
+        lastGeneratedExports,
         session,
-        generatedFiles.fileEntries.map((entry) => buildStatementFileEntry(entry))
-      );
+        fileEntries: generatedFiles.fileEntries.map((entry) => buildStatementFileEntry({
+          ...entry,
+          buildEntryId: buildStatementFileEntryId
+        }))
+      });
 
       rememberLastFileImportContext({
         templateId,
@@ -3676,6 +3522,7 @@ function registerFileHandlers() {
         currency: selectedOption.currency
       };
       const session = getOrCreateStatementImportSession({
+        statementImportSessions,
         templateId: pendingContext.templateId,
         templateName: pendingContext.template.name
       });
@@ -3700,10 +3547,15 @@ function registerFileHandlers() {
       selectionResult.replacePaths.forEach((filePath) => {
         removeStatementSessionEntriesByFilePath(session, filePath);
       });
-      const batchId = appendStatementSessionImport(
+      const batchId = appendStatementSessionImport({
+        buildBatchId: buildStatementBatchId,
+        lastGeneratedExports,
         session,
-        generatedFiles.fileEntries.map((entry) => buildStatementFileEntry(entry))
-      );
+        fileEntries: generatedFiles.fileEntries.map((entry) => buildStatementFileEntry({
+          ...entry,
+          buildEntryId: buildStatementFileEntryId
+        }))
+      });
       rememberLastFileImportContext({
         templateId: pendingContext.templateId,
         template: pendingContext.template,
@@ -4093,12 +3945,15 @@ function registerNewAccountHandlers() {
 
 app.whenReady()
   .then(() => {
+    markStartupMetric(STARTUP_METRIC_MARKS.appReady);
     initializeActivityLog();
 
     const dataPath = path.join(app.getPath('userData'), 'tool-data.sqlite');
     database = new AppDatabase(dataPath);
     database.init();
+    markStartupMetric(STARTUP_METRIC_MARKS.databaseReady);
     syncTemplateLibraryFile();
+    markStartupMetric(STARTUP_METRIC_MARKS.templateLibrarySynced);
 
     registerWindowHandlers();
     registerAppHandlers();
@@ -4108,6 +3963,7 @@ app.whenReady()
     registerTemplateHandlers();
     registerFileHandlers();
     registerNewAccountHandlers();
+    markStartupMetric(STARTUP_METRIC_MARKS.handlersReady);
     createWindow();
   })
   .catch((error) => {

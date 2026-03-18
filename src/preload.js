@@ -2,7 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('desktopApi', {
   app: {
-    getInfo: () => ipcRenderer.invoke('app:get-info')
+    getInfo: () => ipcRenderer.invoke('app:get-info'),
+    reportStartupMetrics: (payload) => ipcRenderer.send('app:report-startup-metrics', payload)
   },
   errors: {
     exportLast: () => ipcRenderer.invoke('error:export-last')

@@ -8,6 +8,25 @@
   - `CHANGELOG.md`
   - `docs/VERSION_FEATURE_HISTORY.md`
 
+## 1.4.0
+
+### 新增
+
+- 无
+
+### 变更
+
+- 这是一次内部治理与结构重构版本；之前的主要功能、导出结果和前端 UI 保持不变。
+- `scripts/smoke-test.js` 按能力拆分为多个 smoke 场景与公共支持模块，继续保留 `npm run smoke` 入口。
+- `src/backend/file-service.js` 拆分为文件读取清洗、标准化、行映射与写出等后端子模块，对外 API 保持原样。
+- `src/backend/database.js` 拆分为迁移、模板仓储和设置仓储等内部模块，`AppDatabase` 继续作为门面层对外提供原有方法。
+- `src/main.js` 中的账单导入会话和导出聚合逻辑被提取到独立模块，主进程入口更聚焦于装配和流程协调。
+- 渲染层中的弹窗工厂与 preview 逻辑拆到独立脚本中，界面布局、按钮位置、文案与交互顺序保持不变。
+
+### 移除
+
+- 无
+
 ## 1.3.5
 
 ### 新增
